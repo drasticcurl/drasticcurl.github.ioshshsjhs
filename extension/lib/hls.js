@@ -1,59 +1,126 @@
-// lib/hls.js — Minimal HLS (M3U8) parser + segment downloader.
+// lib/hls.js — Minimal HLS / fMP4 parser + segment downloader.
 //
-// We only need to handle the subset of HLS that Skool/Mux uses:
-//   * Master playlist with multiple #EXT-X-STREAM-INF variants (one per
-//     resolution).
-//   * Variant (rendition) playlist with #EXTINF segments.
-//   * No encryption (#EXT-X-KEY is absent for Skool native).
-//   * Absolute or relative segment URLs.
+// Skool's native player (Mux) serves HLS-version-7 with:
+//   * A master playlist that lists video variants (#EXT-X-STREAM-INF) AND
+//     a separate audio rendition (#EXT-X-MEDIA:TYPE=AUDIO,URI=...).
+//   * Each rendition is a fragmented-MP4 (CMAF) playlist: every segment
+//     is .m4s, and the playlist begins with an #EXT-X-MAP:URI=...
+//     pointing at the init segment that contains ftyp+moov boxes.
+//   * No encryption.
 //
-// All fetches are performed from the caller's origin (the content script
-// runs on www.skool.com so Origin/Referer are correct automatically).
+// To produce a playable file we concatenate `init + segments` per track
+// (video + audio). The concatenated bytes are a valid fMP4 file that
+// VLC / ffmpeg / mpv all play. Joining audio + video into a single .mp4
+// is done outside the browser via the bundled `_remux.sh` (one ffmpeg
+// `-c copy` command, lossless and ~instant).
+//
+// All fetches are issued from the caller's origin (the content script
+// runs on www.skool.com) so Origin/Referer headers are correct.
 
 import { createLogger } from "./logger.js";
 const log = createLogger("hls");
 
 /**
- * Parse a master playlist and return the list of variants.
- * @param {string} text raw .m3u8 content
- * @param {string} baseUrl URL of this playlist (for resolving relative URLs)
- * @returns {Array<{bandwidth:number, resolution:[w,h]|null, url:string, codecs?:string}>}
+ * Parse a master playlist.
+ * @returns {{
+ *   variants: Array<{bandwidth, resolution, codecs, url, audioGroup}>,
+ *   audioGroups: Record<string, Array<{name, language, default, url}>>,
+ *   subtitleGroups: Record<string, Array<{name, language, default, url}>>,
+ * }}
  */
 export function parseMaster(text, baseUrl) {
   const lines = text.split(/\r?\n/);
   const variants = [];
+  const audioGroups = {};
+  const subtitleGroups = {};
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
-    if (!line.startsWith("#EXT-X-STREAM-INF")) continue;
-    const attrs = parseAttrList(line.substring(line.indexOf(":") + 1));
-    const url = (lines[i + 1] || "").trim();
-    if (!url || url.startsWith("#")) continue;
-    variants.push({
-      bandwidth: Number(attrs.BANDWIDTH || 0),
-      resolution: attrs.RESOLUTION
-        ? attrs.RESOLUTION.split("x").map(Number)
-        : null,
-      codecs: attrs.CODECS,
-      url: new URL(url, baseUrl).toString(),
-    });
+
+    if (line.startsWith("#EXT-X-MEDIA")) {
+      const attrs = parseAttrList(line.substring(line.indexOf(":") + 1));
+      const item = {
+        name: attrs.NAME || null,
+        language: attrs.LANGUAGE || null,
+        default: attrs.DEFAULT === "YES",
+        autoSelect: attrs.AUTOSELECT === "YES",
+        url: attrs.URI ? new URL(attrs.URI, baseUrl).toString() : null,
+      };
+      const groupId = attrs["GROUP-ID"];
+      if (!groupId || !item.url) continue;
+      if (attrs.TYPE === "AUDIO") {
+        (audioGroups[groupId] ||= []).push(item);
+      } else if (attrs.TYPE === "SUBTITLES") {
+        (subtitleGroups[groupId] ||= []).push(item);
+      }
+      continue;
+    }
+
+    if (line.startsWith("#EXT-X-STREAM-INF")) {
+      const attrs = parseAttrList(line.substring(line.indexOf(":") + 1));
+      // Skip lines until we get a non-comment URL line.
+      let url = null;
+      for (let j = i + 1; j < lines.length; j++) {
+        const next = lines[j].trim();
+        if (!next) continue;
+        if (next.startsWith("#")) continue;
+        url = next;
+        i = j;
+        break;
+      }
+      if (!url) continue;
+      variants.push({
+        bandwidth: Number(attrs.BANDWIDTH || 0),
+        averageBandwidth: Number(attrs["AVERAGE-BANDWIDTH"] || 0),
+        resolution: attrs.RESOLUTION
+          ? attrs.RESOLUTION.split("x").map(Number)
+          : null,
+        codecs: attrs.CODECS || null,
+        audioGroup: attrs.AUDIO || null,
+        subtitleGroup: attrs.SUBTITLES || null,
+        url: new URL(url, baseUrl).toString(),
+      });
+    }
   }
-  return variants;
+
+  log.info("parseMaster: parsed", {
+    variantCount: variants.length,
+    variants: variants.map((v) => ({
+      bw: v.bandwidth,
+      res: v.resolution ? v.resolution.join("x") : null,
+      audio: v.audioGroup,
+    })),
+    audioGroupKeys: Object.keys(audioGroups),
+    subtitleGroupKeys: Object.keys(subtitleGroups),
+  });
+  return { variants, audioGroups, subtitleGroups };
 }
 
 /**
- * Parse a rendition (variant) playlist and return the list of segment URLs.
- * @returns {{segments: string[], totalDuration: number}}
+ * Parse a media (rendition) playlist.
+ * Handles fragmented-MP4 with #EXT-X-MAP and classic TS streams.
+ * @returns {{ initSegment: string|null, segments: string[], totalDuration: number }}
  */
 export function parseRendition(text, baseUrl) {
   const lines = text.split(/\r?\n/);
   const segments = [];
+  let initSegment = null;
   let totalDuration = 0;
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
+
+    if (line.startsWith("#EXT-X-MAP")) {
+      const attrs = parseAttrList(line.substring(line.indexOf(":") + 1));
+      if (attrs.URI) {
+        initSegment = new URL(attrs.URI, baseUrl).toString();
+      }
+      continue;
+    }
+
     if (line.startsWith("#EXTINF:")) {
       const dur = parseFloat(line.substring(8));
       if (!Number.isNaN(dur)) totalDuration += dur;
-      // segment URL is the next non-comment line
       for (let j = i + 1; j < lines.length; j++) {
         const next = lines[j].trim();
         if (!next) continue;
@@ -64,14 +131,17 @@ export function parseRendition(text, baseUrl) {
       }
     }
   }
-  return { segments, totalDuration };
+
+  log.info("parseRendition: parsed", {
+    hasInit: !!initSegment,
+    segments: segments.length,
+    totalDuration,
+  });
+  return { initSegment, segments, totalDuration };
 }
 
 /**
- * Pick the variant closest to the desired height. "max" returns the one with
- * the highest bandwidth.
- * @param {Array} variants from parseMaster
- * @param {"max"|"720"|"1080"|number} pref
+ * Pick the variant closest to the desired height. Heights: "max", "720", "1080".
  */
 export function pickVariant(variants, pref) {
   if (!variants.length) return null;
@@ -79,46 +149,51 @@ export function pickVariant(variants, pref) {
     return variants.reduce((a, b) => (b.bandwidth > a.bandwidth ? b : a));
   }
   const targetH = typeof pref === "number" ? pref : parseInt(pref, 10);
-  // exact match first
   const exact = variants.find((v) => v.resolution && v.resolution[1] === targetH);
   if (exact) return exact;
-  // else closest <= target
   const below = variants
     .filter((v) => v.resolution && v.resolution[1] <= targetH)
     .sort((a, b) => b.resolution[1] - a.resolution[1]);
   if (below.length) return below[0];
-  // else lowest above
   const above = variants
     .filter((v) => v.resolution && v.resolution[1] > targetH)
     .sort((a, b) => a.resolution[1] - b.resolution[1]);
   if (above.length) return above[0];
-  // fallback: highest bandwidth
   return variants.reduce((a, b) => (b.bandwidth > a.bandwidth ? b : a));
 }
 
 /**
- * Download all segments and return a single Uint8Array of the concatenated
- * MPEG-TS stream.
+ * Pick the audio rendition matching the variant's AUDIO group. Prefers the
+ * default item; falls back to the first.
+ */
+export function pickAudio(audioGroups, variant) {
+  if (!variant?.audioGroup) return null;
+  const group = audioGroups[variant.audioGroup];
+  if (!group || !group.length) return null;
+  return group.find((g) => g.default) || group[0];
+}
+
+/**
+ * Fetch every segment + the init segment, return a single Uint8Array of the
+ * concatenated bytes (init first).
  *
- * @param {string[]} segmentUrls
+ * @param {{initSegment: string|null, segments: string[]}} track
  * @param {(done:number, total:number)=>void} onProgress
  * @param {AbortSignal} signal
- * @param {number} concurrency parallel fetches
+ * @param {number} concurrency
  */
-export async function downloadSegments(
-  segmentUrls,
-  onProgress,
-  signal,
-  concurrency = 6
-) {
-  const total = segmentUrls.length;
+export async function downloadTrack(track, onProgress, signal, concurrency = 6) {
+  const allUrls = [];
+  if (track.initSegment) allUrls.push(track.initSegment);
+  allUrls.push(...track.segments);
+  const total = allUrls.length;
   const chunks = new Array(total);
   let done = 0;
 
   async function worker(startIdx) {
     for (let i = startIdx; i < total; i += concurrency) {
       if (signal?.aborted) throw new Error("aborted");
-      const url = segmentUrls[i];
+      const url = allUrls[i];
       let attempt = 0;
       while (true) {
         try {
@@ -134,8 +209,7 @@ export async function downloadSegments(
             });
             throw new Error("HTTP " + resp.status);
           }
-          const buf = new Uint8Array(await resp.arrayBuffer());
-          chunks[i] = buf;
+          chunks[i] = new Uint8Array(await resp.arrayBuffer());
           break;
         } catch (e) {
           attempt++;
@@ -160,7 +234,6 @@ export async function downloadSegments(
     Array.from({ length: Math.min(concurrency, total) }, (_, k) => worker(k))
   );
 
-  // Compute total length and concatenate
   let totalLen = 0;
   for (const c of chunks) totalLen += c.byteLength;
   const out = new Uint8Array(totalLen);
@@ -172,9 +245,7 @@ export async function downloadSegments(
   return out;
 }
 
-/**
- * Fetch a playlist (master or rendition) and return its text.
- */
+/** Fetch a playlist (master or rendition) and return its text. */
 export async function fetchPlaylist(url) {
   log.debug("fetchPlaylist", { url: String(url).slice(0, 120) });
   let resp;
@@ -200,14 +271,8 @@ export async function fetchPlaylist(url) {
   return resp.text();
 }
 
-/** Expose the logger so callers can append entries (debug only). */
-export const _log = log;
-
-// --- helpers ---
-
+// ---- helpers ----
 function parseAttrList(s) {
-  // Parses the comma-separated attribute list of an EXT-X-STREAM-INF line,
-  // honoring quoted values (which may contain commas).
   const out = {};
   const re = /([A-Z0-9-]+)=("([^"]*)"|([^,]*))/g;
   let m;
@@ -216,7 +281,8 @@ function parseAttrList(s) {
   }
   return out;
 }
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+export const _log = log;

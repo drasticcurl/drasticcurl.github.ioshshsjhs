@@ -9,64 +9,70 @@ log.info("service worker booted", {
   ts: new Date().toISOString(),
 });
 
-const captures = new Map(); // tabId -> { masterUrl, capturedAt, lessonId }
+// captures[tabId] = {
+//   masterUrl: string|null,    // most recent MASTER playlist URL seen
+//   masterAt: number|null,     // when it was captured
+//   pendingLesson: string|null,// the lesson the walker is currently waiting on
+//   pendingSetAt: number|null, // when we last set pendingLesson
+// }
+const captures = new Map();
 
-/**
- * Watch every request on every URL. We filter inside the listener for
- * anything that looks like an HLS playlist or video manifest. This
- * intentionally broad scope was added in v0.2 because Skool's native player
- * may be served from hosts other than *.video.skool.com (e.g. Mux directly).
- */
-function isVideoManifestUrl(u) {
-  return /\.m3u8(\?|$)/i.test(u) || /\/manifest[^?]*\.(m3u8|mpd)/i.test(u);
+function isMasterPlaylistUrl(u) {
+  if (!/\.m3u8(\?|$)/i.test(u)) return false;
+  // Skool's per-track renditions live at /<id>/rendition.m3u8 — skip those.
+  if (/\/rendition\.m3u8/i.test(u)) return false;
+  return true;
+}
+
+function isAnyPlaylistUrl(u) {
+  return /\.m3u8(\?|$)/i.test(u);
 }
 
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
     if (details.tabId < 0) return;
-    if (!isVideoManifestUrl(details.url)) return;
+    if (!isAnyPlaylistUrl(details.url)) return;
 
-    const prev = captures.get(details.tabId) ?? {};
-    captures.set(details.tabId, {
-      masterUrl: details.url,
-      capturedAt: Date.now(),
-      lessonId: prev.lessonId ?? null,
-    });
-
-    log.info("manifest captured via webRequest", {
+    const isMaster = isMasterPlaylistUrl(details.url);
+    log.info(isMaster ? "master m3u8 captured" : "rendition m3u8 seen", {
       tabId: details.tabId,
-      lessonId: prev.lessonId,
       method: details.method,
       type: details.type,
       url: details.url,
     });
 
-    chrome.tabs
-      .sendMessage(details.tabId, {
-        type: "m3u8-captured",
-        url: details.url,
-        capturedAt: Date.now(),
-      })
-      .catch((e) =>
-        log.debug("could not notify content of capture", { e: String(e) })
-      );
+    if (isMaster) {
+      const cur = captures.get(details.tabId) ?? {};
+      captures.set(details.tabId, {
+        ...cur,
+        masterUrl: details.url,
+        masterAt: Date.now(),
+      });
+      // Notify content script so any awaitNextCapture() resolves.
+      chrome.tabs
+        .sendMessage(details.tabId, {
+          type: "m3u8-captured",
+          url: details.url,
+          capturedAt: Date.now(),
+        })
+        .catch(() => {});
+    }
   },
   { urls: ["<all_urls>"] },
   ["requestHeaders"]
 );
 
-// Also log every fetched URL that contains "video" or "stream" or "media"
-// for diagnostic purposes — many video CDN endpoints have those tokens.
+// Diagnostic listener — logs any URL that looks video-related but isn't a
+// playlist. Helps see segment fetches in the bg log.
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.tabId < 0) return;
     const u = details.url;
     if (!/(video|stream|media|mux|hls|playback)/i.test(u)) return;
-    if (isVideoManifestUrl(u)) return; // already logged above
+    if (isAnyPlaylistUrl(u)) return;
     log.debug("video-ish request seen", {
       tabId: details.tabId,
       type: details.type,
-      method: details.method,
       url: u.length > 200 ? u.slice(0, 200) + "…" : u,
     });
   },
@@ -79,6 +85,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   switch (msg?.type) {
     case "set-pending-lesson": {
+      // IMPORTANT v0.3 fix: we do NOT clear masterUrl here. The content
+      // script decides whether to reuse it (if recent enough) or wait
+      // for a fresh one based on the timestamp.
       if (tabId == null) {
         sendResponse({ ok: false, error: "no tabId" });
         break;
@@ -86,19 +95,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const cur = captures.get(tabId) ?? {};
       captures.set(tabId, {
         ...cur,
-        lessonId: msg.lessonId,
-        masterUrl: null,
-        capturedAt: null,
+        pendingLesson: msg.lessonId,
+        pendingSetAt: Date.now(),
       });
-      log.info("set-pending-lesson", { tabId, lessonId: msg.lessonId });
-      sendResponse({ ok: true });
+      log.info("set-pending-lesson", {
+        tabId,
+        lessonId: msg.lessonId,
+        keepingExistingMaster: !!cur.masterUrl,
+        masterAge: cur.masterAt ? Date.now() - cur.masterAt : null,
+      });
+      sendResponse({ ok: true, existingMaster: cur.masterUrl ?? null });
       break;
     }
 
     case "get-capture": {
       const targetTabId = msg.tabId ?? tabId;
       const cap = captures.get(targetTabId) ?? null;
-      log.debug("get-capture", { tabId: targetTabId, hasCapture: !!cap });
+      log.debug("get-capture", { tabId: targetTabId, hasCapture: !!cap?.masterUrl });
       sendResponse(cap);
       break;
     }
@@ -127,17 +140,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         })
         .then(
           (id) => {
-            log.info("download started", {
-              downloadId: id,
-              filename: msg.filename,
-            });
+            log.info("download started", { downloadId: id, filename: msg.filename });
             sendResponse({ ok: true, downloadId: id });
           },
           (err) => {
-            log.error("download failed", {
-              filename: msg.filename,
-              error: String(err),
-            });
+            log.error("download failed", { filename: msg.filename, error: String(err) });
             sendResponse({ ok: false, error: String(err) });
           }
         );
@@ -178,8 +185,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (captures.delete(tabId))
-    log.info("tab closed, capture cleared", { tabId });
+  if (captures.delete(tabId)) log.info("tab closed, capture cleared", { tabId });
 });
 
 self.addEventListener("error", (e) => {

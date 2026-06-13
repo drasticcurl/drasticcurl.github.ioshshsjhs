@@ -1,14 +1,21 @@
 // content.js — runs in the page context of *.skool.com.
 //
-// v0.2 — decouples capture from finding a <video> element. The new flow is:
+// v0.3 — Skool's player is a lazy-mounted Mux fMP4/CMAF player with
+// SEPARATE audio + video tracks. The new download pipeline:
 //
-//   navigate → snapshot the player DOM → start awaitNextCapture → in
-//   parallel try multiple "nudge" strategies (scrollIntoView, focus
-//   iframe, click play button, etc.) → on m3u8 fire, download.
-//
-// All file fetches happen here (in skool.com origin) so Origin/Referer
-// are correct for the CDN. We then hand a blob: URL to background.js
-// which calls chrome.downloads.download.
+//   1. Walker enters a lesson and asks bg for the most recent master
+//      .m3u8 URL captured on this tab.
+//   2. If that URL is fresh (less than 5 min old) AND was captured after
+//      we started this lesson \u2014 use it directly. No need to nudge.
+//   3. Otherwise, navigate (or stay) on the lesson, nudge the player
+//      (click center of poster, scrollIntoView, fire mux-player.play()),
+//      wait up to 45s for a fresh master capture.
+//   4. Parse the master, pick a video variant by quality + the matching
+//      audio rendition.
+//   5. Download both tracks (init + segments) in parallel, save as
+//      <lesson>.video.mp4 and <lesson>.audio.mp4.
+//   6. After the walker finishes, drop a _remux.sh that merges every
+//      pair into a single <lesson>.mp4 with ffmpeg -c copy.
 
 (() => {
   if (window.__skoolDLInstalled) return;
@@ -91,7 +98,7 @@
   }
 
   // ===================================================================
-  // 1) Classroom DOM scanner
+  // Classroom DOM scanner
   // ===================================================================
 
   function scanClassroom() {
@@ -104,66 +111,39 @@
       scannedAt: new Date().toISOString(),
       pageUrl: location.href,
     };
-    lg().info("scan: classroom name detected", { name: out.classroomName });
-    lg().info("scan: community detected", { name: out.communityName });
+    lg().info("scan: classroom name", { name: out.classroomName });
 
     const allLinks = document.querySelectorAll('a[href*="md="]');
-    lg().info("scan: anchor[href*=md=] elements", { count: allLinks.length });
+    lg().info("scan: anchor[href*=md=] count", { count: allLinks.length });
 
     const seen = new Set();
     const lessons = [];
-    allLinks.forEach((a, idx) => {
+    allLinks.forEach((a) => {
       const m = /[?&]md=([a-f0-9]{32})/i.exec(a.href);
-      if (!m) {
-        lg().debug("scan: skipping anchor (no 32-hex md)", {
-          idx,
-          href: a.href,
-        });
-        return;
-      }
+      if (!m) return;
       const md = m[1];
       if (seen.has(md)) return;
       seen.add(md);
-
       const title = cleanText(a.textContent) || `Lesson ${md.slice(0, 6)}`;
-      const sectionTitle = findSectionTitle(a) || null;
-      lessons.push({ md, title, url: absUrl(a.href), sectionTitle });
+      lessons.push({ md, title, url: absUrl(a.href), sectionTitle: null });
     });
-    lg().info("scan: unique lessons found", {
+    lg().info("scan: unique lessons", {
       count: lessons.length,
       sample: lessons.slice(0, 3).map((l) => ({ md: l.md, title: l.title })),
     });
 
-    // Group into sections. Strategy:
-    //   1) If at least one lesson got a real sectionTitle from the DOM, use
-    //      DOM-derived grouping.
-    //   2) Otherwise, fall back to numeric-prefix grouping ("1.X", "2.X"…).
-    //   3) Otherwise, single "Sin sección" bucket.
     let sectionsMap = new Map();
-    const haveDomSection = lessons.some((l) => l.sectionTitle);
-
-    if (haveDomSection) {
-      lg().info("scan: grouping by DOM-derived section titles");
-      lessons.forEach((l) => {
-        const key = l.sectionTitle || "Sin sección";
-        if (!sectionsMap.has(key)) sectionsMap.set(key, []);
-        sectionsMap.get(key).push(l);
-      });
-    } else if (
+    if (
       lessons.length > 1 &&
       lessons.every((l) => /^\d+\.\d+\b/.test(l.title))
     ) {
-      lg().info("scan: grouping by numeric prefix (N.X)");
+      lg().info("scan: grouping by N.X numeric prefix");
       lessons.forEach((l) => {
         const m = /^(\d+)\.(\d+)/.exec(l.title);
         const k = `Module ${m[1]}`;
-        if (!sectionsMap.has(k)) sectionsMap.set(k, []);
-        sectionsMap.get(k).push(l);
+        (sectionsMap.get(k) ?? sectionsMap.set(k, []).get(k)).push(l);
       });
     } else {
-      lg().warn(
-        "scan: no DOM section + no numeric prefix; using single bucket"
-      );
       sectionsMap.set("Sin sección", lessons.slice());
     }
 
@@ -176,7 +156,7 @@
       });
     });
     out.flatLessons = lessons;
-    lg().info("scan: built tree", {
+    lg().info("scan: tree built", {
       sections: out.sections.length,
       totalLessons: lessons.length,
       sectionTitles: out.sections.map((s) => s.title),
@@ -186,11 +166,16 @@
 
   function detectClassroomName() {
     const t = document.title || "";
-    const parts = t.split("|").map((s) => s.trim());
+    const norm = t.replace(/[\u00b7|]/g, "|"); // treat · and | the same
+    const parts = norm.split("|").map((s) => s.trim()).filter(Boolean);
     if (parts.length >= 2) {
+      // "Classroom · Acelerador 10k" → take "Acelerador 10k"
+      // "Lesson - Course | Community | Skool" → take "Course"
       const left = parts[0];
       const dashSplit = left.split(" - ");
       if (dashSplit.length >= 2) return dashSplit[dashSplit.length - 1];
+      // If first segment is the literal word "Classroom", prefer the next.
+      if (/^classroom$/i.test(left) && parts[1]) return parts[1];
       return left;
     }
     const h1 = document.querySelector("h1");
@@ -200,50 +185,11 @@
 
   function detectCommunityName() {
     const m = /^\/([^\/]+)\/classroom/.exec(location.pathname);
-    if (m) return m[1];
-    return "skool";
-  }
-
-  function findSectionTitle(a) {
-    let node = a;
-    for (let i = 0; i < 8 && node; i++) {
-      let prev = node.previousElementSibling;
-      while (prev) {
-        const txt = cleanText(prev.textContent);
-        if (looksLikeSectionTitle(prev, txt)) return txt;
-        prev = prev.previousElementSibling;
-      }
-      node = node.parentElement;
-    }
-    let cur = a.parentElement;
-    for (let i = 0; i < 6 && cur; i++) {
-      const btn = cur.querySelector(":scope > button, :scope > [role='button']");
-      if (btn) {
-        const txt = cleanText(btn.textContent);
-        if (txt && txt.length < 120) return txt;
-      }
-      cur = cur.parentElement;
-    }
-    return null;
-  }
-
-  function looksLikeSectionTitle(el, txt) {
-    if (!txt) return false;
-    if (txt.length > 120) return false;
-    if (txt.includes("\n")) return false;
-    const tag = el.tagName;
-    if (/^H[1-6]$/.test(tag)) return true;
-    if (el.getAttribute("role") === "heading") return true;
-    try {
-      const style = getComputedStyle(el);
-      if (parseInt(style.fontWeight, 10) >= 600 && el.children.length <= 3)
-        return true;
-    } catch {}
-    return false;
+    return m ? m[1] : "skool";
   }
 
   // ===================================================================
-  // 2) Player DOM inspection — diagnostic dump
+  // Player DOM inspection — diagnostic dump
   // ===================================================================
 
   function inspectPlayerDom() {
@@ -251,18 +197,12 @@
       const r = f.getBoundingClientRect();
       return {
         src: (f.src || "").slice(0, 200),
-        srcdoc: !!f.srcdoc,
         title: f.title || null,
         name: f.name || null,
         w: Math.round(r.width),
         h: Math.round(r.height),
-        visible: r.width > 0 && r.height > 0,
         sameOrigin: (() => {
-          try {
-            return !!f.contentDocument;
-          } catch {
-            return false;
-          }
+          try { return !!f.contentDocument; } catch { return false; }
         })(),
       };
     });
@@ -277,35 +217,40 @@
       .filter((e) => e.tagName.includes("-"))
       .map((e) => e.tagName.toLowerCase());
     const customElTypes = [...new Set(customEls)];
-    const muxLike = customElTypes.filter((t) =>
-      /mux|player|video|hls/i.test(t)
-    );
-    const playerCandidates = Array.from(
+
+    // Anything class-named like a player
+    const playerLike = Array.from(
       document.querySelectorAll(
-        '[class*="video" i], [class*="player" i], [data-testid*="video" i], [data-testid*="player" i]'
+        '[class*="MuxPlayer" i], [class*="VideoPlayer" i], [class*="Video" i], [class*="Player" i], [class*="Poster" i], [class*="Thumbnail" i], [class*="Preview" i]'
       )
     )
-      .slice(0, 10)
-      .map((e) => ({
-        tag: e.tagName,
-        cls: (e.className || "").toString().slice(0, 80),
-        testid: e.getAttribute("data-testid"),
-      }));
+      .slice(0, 30)
+      .map((e) => {
+        const r = e.getBoundingClientRect();
+        return {
+          tag: e.tagName,
+          cls: (e.className || "").toString().slice(0, 80),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          visible: r.width > 0 && r.height > 0,
+        };
+      });
+
     const summary = {
+      url: location.href,
       iframes,
       videos,
       customElCount: customEls.length,
       customElTypes: customElTypes.slice(0, 30),
-      muxLike,
-      playerCandidates,
-      url: location.href,
+      muxLike: customElTypes.filter((t) => /mux|player|video|hls/i.test(t)),
+      playerLike,
     };
     lg().info("inspectPlayerDom", summary);
     return summary;
   }
 
   // ===================================================================
-  // 3) SPA navigation
+  // SPA navigation
   // ===================================================================
 
   async function navigateToLesson(lessonUrl) {
@@ -322,13 +267,11 @@
       (a) => a.href === target.href
     );
     if (link) {
-      lg().debug("nav: clicking matching sidebar <a>");
+      lg().debug("nav: clicking sidebar link");
       link.scrollIntoView({ block: "nearest" });
       link.click();
     } else {
-      lg().warn(
-        "nav: no matching <a> in sidebar; falling back to history.pushState"
-      );
+      lg().warn("nav: no sidebar link match; using history.pushState");
       history.pushState({}, "", target.pathname + target.search);
       window.dispatchEvent(new PopStateEvent("popstate"));
     }
@@ -338,13 +281,9 @@
   }
 
   // ===================================================================
-  // 4) Player nudging — best effort, multiple strategies
+  // Player nudging — make the player initialize / fetch its manifest
   // ===================================================================
 
-  /**
-   * Try every strategy we know to make the player initialize and start
-   * fetching its manifest. Returns a description of what was tried.
-   */
   function nudgePlayer() {
     const tried = [];
 
@@ -353,28 +292,22 @@
     if (v) {
       try {
         v.muted = true;
-        const p = v.play();
-        if (p && typeof p.catch === "function") p.catch(() => {});
+        v.play()?.catch?.(() => {});
         tried.push("video.play()");
-      } catch (e) {
-        tried.push("video.play()→threw:" + String(e?.message || e));
-      }
+      } catch {}
     }
 
-    // 2) <mux-player>/<mux-video>
+    // 2) mux-player web component already mounted
     const mp = document.querySelector("mux-player, mux-video");
     if (mp) {
       try {
         mp.muted = true;
-        const p = mp.play?.();
-        if (p && typeof p.catch === "function") p.catch(() => {});
+        mp.play?.()?.catch?.(() => {});
         tried.push("mux-player.play()");
-      } catch (e) {
-        tried.push("mux-player.play()→threw:" + String(e?.message || e));
-      }
+      } catch {}
     }
 
-    // 3) <video> inside same-origin iframes
+    // 3) Same-origin iframes (rare but possible)
     document.querySelectorAll("iframe").forEach((f, i) => {
       try {
         const doc = f.contentDocument;
@@ -382,51 +315,60 @@
         const innerV = doc.querySelector("video");
         if (innerV) {
           innerV.muted = true;
-          const p = innerV.play();
-          if (p && typeof p.catch === "function") p.catch(() => {});
+          innerV.play()?.catch?.(() => {});
           tried.push(`iframe[${i}]:video.play()`);
         }
-      } catch {
-        /* cross-origin → ignore */
-      }
+      } catch {}
     });
 
-    // 4) Scroll the largest player-looking element into view (triggers
-    //    IntersectionObserver-based lazy loading).
-    const candidates = Array.from(
-      document.querySelectorAll(
-        'iframe, [class*="video" i], [class*="player" i], [data-testid*="video" i], [data-testid*="player" i]'
-      )
-    )
-      .map((e) => ({ el: e, r: e.getBoundingClientRect() }))
-      .filter((x) => x.r.width > 100 && x.r.height > 60)
-      .sort((a, b) => b.r.width * b.r.height - a.r.width * a.r.height);
-    if (candidates.length) {
-      const top = candidates[0].el;
-      top.scrollIntoView({ block: "center", behavior: "instant" });
-      tried.push("scrollIntoView:" + (top.tagName || ""));
-      // 5) Focus the iframe (sometimes triggers cross-origin player init).
-      if (top.tagName === "IFRAME") {
-        try {
-          top.contentWindow?.focus?.();
-          tried.push("iframe.focus()");
-        } catch {}
+    // 4) Find the largest "player-looking" element and click its center
+    const wrapper = findPlayerWrapper();
+    if (wrapper) {
+      wrapper.scrollIntoView({ block: "center", behavior: "instant" });
+      tried.push("scrollIntoView:" + (wrapper.className || "").toString().slice(0, 30));
+
+      const r = wrapper.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      const target = document.elementFromPoint(cx, cy);
+      if (target) {
+        // Full mouse event sequence to fool any "real user click" guard
+        for (const type of ["mouseover", "mousedown", "mouseup", "click"]) {
+          try {
+            target.dispatchEvent(
+              new MouseEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                clientX: cx,
+                clientY: cy,
+                button: 0,
+              })
+            );
+          } catch {}
+        }
+        tried.push(
+          "elementFromPoint.click:" +
+            target.tagName +
+            "." +
+            (target.className || "").toString().slice(0, 30)
+        );
       }
     }
 
-    // 6) Click any visible play-looking button.
-    const playBtn = Array.from(
+    // 5) Fallback: click any visible play-labeled button
+    const btn = Array.from(
       document.querySelectorAll(
         'button, [role="button"], [aria-label*="play" i], [aria-label*="reproducir" i], [data-testid*="play" i]'
       )
     ).find((b) => {
       const r = b.getBoundingClientRect();
-      return r.width > 20 && r.height > 20;
+      return r.width > 30 && r.height > 30;
     });
-    if (playBtn) {
+    if (btn) {
       try {
-        playBtn.click();
-        tried.push("playBtn.click():" + (playBtn.getAttribute("aria-label") || playBtn.tagName));
+        btn.click();
+        tried.push("playBtn.click:" + (btn.getAttribute("aria-label") || btn.tagName));
       } catch {}
     }
 
@@ -434,376 +376,452 @@
     return tried;
   }
 
+  function findPlayerWrapper() {
+    const all = Array.from(
+      document.querySelectorAll(
+        '[class*="MuxPlayer" i], [class*="VideoPlayer" i], [class*="VideoPoster" i], ' +
+          '[class*="VideoThumb" i], [class*="VideoPreview" i], ' +
+          '[class*="VideoContainer" i], [class*="VideoFrame" i], ' +
+          '[class*="VideoWrapper" i], [class*="VideoDuration" i]'
+      )
+    );
+    let best = null;
+    let bestArea = 0;
+    for (const el of all) {
+      const r = el.getBoundingClientRect();
+      const area = r.width * r.height;
+      if (r.width >= 200 && r.height >= 100 && area > bestArea) {
+        best = el;
+        bestArea = area;
+      }
+    }
+    if (best) {
+      // Walk up to a parent up to ~80% of viewport, in case the matched el
+      // is a small label (like VideoDuration).
+      let cur = best;
+      while (cur.parentElement) {
+        const pr = cur.parentElement.getBoundingClientRect();
+        const pa = pr.width * pr.height;
+        if (
+          pr.width <= window.innerWidth * 0.95 &&
+          pr.height <= window.innerHeight * 0.9 &&
+          pa > bestArea * 1.1
+        ) {
+          best = cur.parentElement;
+          bestArea = pa;
+          cur = cur.parentElement;
+        } else break;
+      }
+    }
+    return best;
+  }
+
   // ===================================================================
-  // 5) Per-lesson capture-and-download
+  // Per-lesson download pipeline (video + audio, fMP4)
   // ===================================================================
 
-  async function captureAndDownload({
+  async function downloadLessonTracks({
     masterUrl,
     quality,
-    targetFilename,
+    targetDir,
+    targetBase,
     onProgress,
   }) {
     const { hlsMod } = await loadModules();
     lg().info("dl: start", {
-      targetFilename,
-      quality,
       masterUrlPrefix: String(masterUrl).slice(0, 80),
+      targetDir,
+      targetBase,
+      quality,
     });
 
     onProgress?.({ phase: "playlist" });
-    lg().debug("dl: fetching master playlist");
     const masterText = await hlsMod.fetchPlaylist(masterUrl);
-    lg().info("dl: master playlist fetched", { bytes: masterText.length });
+    lg().info("dl: master fetched", { bytes: masterText.length });
 
-    let renditionUrl;
-    let chosenVariant = null;
-    if (/#EXT-X-STREAM-INF/.test(masterText)) {
-      const variants = hlsMod.parseMaster(masterText, masterUrl);
-      lg().info("dl: master has variants", {
-        count: variants.length,
-        variants: variants.map((v) => ({
-          bw: v.bandwidth,
-          res: v.resolution ? v.resolution.join("x") : null,
-        })),
-      });
-      chosenVariant = hlsMod.pickVariant(variants, quality);
-      if (!chosenVariant) {
-        lg().error("dl: no variant could be picked");
-        throw new Error("no variant found in master");
-      }
-      lg().info("dl: variant chosen", {
-        wanted: quality,
-        bw: chosenVariant.bandwidth,
-        res: chosenVariant.resolution
-          ? chosenVariant.resolution.join("x")
-          : null,
-      });
-      renditionUrl = chosenVariant.url;
-    } else {
-      lg().warn("dl: master had no STREAM-INF; treating URL as rendition");
-      renditionUrl = masterUrl;
+    const master = hlsMod.parseMaster(masterText, masterUrl);
+    if (!master.variants.length) {
+      throw new Error("master has no variants");
     }
-    onProgress?.({ phase: "rendition", variant: chosenVariant });
-
-    lg().debug("dl: fetching rendition playlist");
-    const renditionText = await hlsMod.fetchPlaylist(renditionUrl);
-    lg().info("dl: rendition fetched", { bytes: renditionText.length });
-    const { segments, totalDuration } = hlsMod.parseRendition(
-      renditionText,
-      renditionUrl
-    );
-    lg().info("dl: rendition parsed", {
-      segments: segments.length,
-      totalDuration,
-      firstSegmentPrefix: segments[0]?.slice(0, 80),
+    const videoVariant = hlsMod.pickVariant(master.variants, quality);
+    if (!videoVariant) throw new Error("no video variant could be picked");
+    const audioRendition = hlsMod.pickAudio(master.audioGroups, videoVariant);
+    lg().info("dl: chosen", {
+      video: videoVariant
+        ? {
+            bw: videoVariant.bandwidth,
+            res: videoVariant.resolution
+              ? videoVariant.resolution.join("x")
+              : null,
+          }
+        : null,
+      audio: audioRendition
+        ? { name: audioRendition.name, lang: audioRendition.language }
+        : null,
     });
-    if (!segments.length) {
-      lg().error("dl: rendition has zero segments");
-      throw new Error("no segments in rendition");
-    }
 
+    onProgress?.({ phase: "rendition", variant: videoVariant });
+
+    // Fetch both rendition playlists.
+    const [videoText, audioText] = await Promise.all([
+      hlsMod.fetchPlaylist(videoVariant.url),
+      audioRendition ? hlsMod.fetchPlaylist(audioRendition.url) : null,
+    ]);
+    const videoTrack = hlsMod.parseRendition(videoText, videoVariant.url);
+    const audioTrack = audioText
+      ? hlsMod.parseRendition(audioText, audioRendition.url)
+      : null;
+    lg().info("dl: tracks parsed", {
+      videoSegments: videoTrack.segments.length,
+      videoHasInit: !!videoTrack.initSegment,
+      audioSegments: audioTrack?.segments?.length ?? 0,
+      audioHasInit: !!audioTrack?.initSegment,
+      durationSec: videoTrack.totalDuration,
+    });
+
+    const totalSegments =
+      videoTrack.segments.length +
+      (videoTrack.initSegment ? 1 : 0) +
+      (audioTrack ? audioTrack.segments.length + (audioTrack.initSegment ? 1 : 0) : 0);
     onProgress?.({
       phase: "segments",
-      total: segments.length,
+      total: totalSegments,
       done: 0,
-      durationSec: totalDuration,
+      durationSec: videoTrack.totalDuration,
     });
 
-    lg().info("dl: downloading segments…", {
-      total: segments.length,
-      concurrency: 6,
-    });
+    // Download video + audio in parallel. Each callback updates a shared
+    // counter for combined progress reporting.
+    let combinedDone = 0;
     let lastReportedAt = 0;
-    const ts = await hlsMod.downloadSegments(
-      segments,
-      (done, total) => {
-        onProgress?.({ phase: "segments", total, done });
-        const now = Date.now();
-        if (done === total || now - lastReportedAt > 1500) {
-          lg().debug("dl: segment progress", { done, total });
-          lastReportedAt = now;
-        }
-      },
-      undefined,
-      6
-    );
-    lg().info("dl: all segments fetched", { bytes: ts.byteLength });
+    function bumpProgress() {
+      combinedDone++;
+      const now = Date.now();
+      if (combinedDone === totalSegments || now - lastReportedAt > 800) {
+        onProgress?.({ phase: "segments", total: totalSegments, done: combinedDone });
+        lastReportedAt = now;
+      }
+    }
+
+    const [videoBytes, audioBytes] = await Promise.all([
+      hlsMod.downloadTrack(videoTrack, () => bumpProgress(), undefined, 6),
+      audioTrack
+        ? hlsMod.downloadTrack(audioTrack, () => bumpProgress(), undefined, 6)
+        : Promise.resolve(null),
+    ]);
+    lg().info("dl: tracks fetched", {
+      videoBytes: videoBytes.byteLength,
+      audioBytes: audioBytes?.byteLength ?? 0,
+    });
 
     onProgress?.({ phase: "saving" });
-    const blob = new Blob([ts], { type: "video/mp2t" });
-    const blobUrl = URL.createObjectURL(blob);
-    lg().info("dl: blob created", { bytes: ts.byteLength });
+
+    const videoFilename = `${targetDir}/${targetBase}.video.mp4`;
+    const audioFilename = audioBytes
+      ? `${targetDir}/${targetBase}.audio.mp4`
+      : null;
+
+    await sendDownload(videoBytes, "video/mp4", videoFilename);
+    if (audioBytes) {
+      await sendDownload(audioBytes, "video/mp4", audioFilename);
+    }
+
+    return {
+      videoFilename,
+      audioFilename,
+      videoBytes: videoBytes.byteLength,
+      audioBytes: audioBytes?.byteLength ?? 0,
+      totalBytes:
+        videoBytes.byteLength + (audioBytes?.byteLength ?? 0),
+      durationSec: videoTrack.totalDuration,
+      resolution: videoVariant.resolution
+        ? videoVariant.resolution.join("x")
+        : null,
+    };
+  }
+
+  async function sendDownload(bytes, mime, filename) {
+    const blob = new Blob([bytes], { type: mime });
+    const url = URL.createObjectURL(blob);
     try {
       const resp = await chrome.runtime.sendMessage({
         type: "download",
-        url: blobUrl,
-        filename: targetFilename,
+        url,
+        filename,
       });
       if (!resp?.ok) {
-        lg().error("dl: chrome.downloads.download failed", {
+        lg().error("dl: chrome.downloads failed", {
+          filename,
           error: resp?.error,
         });
         throw new Error(resp?.error || "download failed");
       }
       lg().info("dl: download dispatched", {
         downloadId: resp.downloadId,
-        filename: targetFilename,
+        filename,
       });
-      await sleep(2000);
+      await sleep(1500);
     } finally {
-      URL.revokeObjectURL(blobUrl);
+      URL.revokeObjectURL(url);
     }
-    return { sizeBytes: ts.byteLength, segments: segments.length };
   }
 
   // ===================================================================
-  // 6) Single-lesson processing (used by walker AND manual)
+  // Get-or-wait master URL for the current lesson
   // ===================================================================
 
-  async function processLesson({
-    lesson,
-    targetFilename,
-    quality,
-    onUpdate,
-  }) {
-    // Tell background which lesson we're about to process so the next
-    // captured manifest is associated with this one (and any stale capture
-    // is cleared).
-    await chrome.runtime.sendMessage({
-      type: "set-pending-lesson",
-      lessonId: lesson.md,
-    });
+  /**
+   * After a navigation, try to obtain a master m3u8 URL for the current
+   * lesson. Returns { url, source }.
+   *  - Strategy A: ask bg if we already have a recent master (< 5 min
+   *    old) AND it was captured AT OR AFTER nav started → reuse it.
+   *  - Strategy B: nudge the player and await a fresh capture (45s).
+   */
+  async function obtainMasterUrl(navStartedAt, attempts = 3) {
+    // Strategy A
+    const cap = await chrome.runtime.sendMessage({ type: "get-capture" });
+    if (cap?.masterUrl && cap?.masterAt) {
+      const age = Date.now() - cap.masterAt;
+      if (age < 5 * 60 * 1000) {
+        // Reuse if either: captured AFTER we started this nav, OR captured
+        // within the last 60s (probably the user just opened the lesson
+        // before clicking "auto-walk").
+        if (cap.masterAt >= navStartedAt - 1000 || age < 60000) {
+          lg().info("obtainMaster: reusing existing capture", {
+            ageMs: age,
+            capturedAt: new Date(cap.masterAt).toISOString(),
+          });
+          return { url: cap.masterUrl, source: "reused" };
+        }
+        lg().debug("obtainMaster: existing capture too old for this nav", {
+          ageMs: age,
+        });
+      }
+    }
 
-    // Wait a beat for the SPA to render the new lesson.
-    await sleep(800);
-
-    // Snapshot the player DOM once for diagnostics.
-    inspectPlayerDom();
-
-    // Start the capture wait BEFORE nudging so we never miss a fast capture.
-    const capturePromise = awaitNextCapture(45000);
-
-    // Nudge the player. If nothing fires within 5s, nudge again.
-    const nudge1 = nudgePlayer();
-    let nudge2 = null;
-    let nudge3 = null;
-    const nudgeTimer1 = setTimeout(() => {
-      lg().info("retry-nudge: 5s elapsed, nudging again");
-      nudge2 = nudgePlayer();
+    // Strategy B
+    const promise = awaitNextCapture(45000);
+    nudgePlayer();
+    const t1 = setTimeout(() => {
+      lg().info("obtainMaster: 5s elapsed, nudge again");
+      nudgePlayer();
     }, 5000);
-    const nudgeTimer2 = setTimeout(() => {
-      lg().warn("retry-nudge: 15s elapsed, third try");
-      nudge3 = nudgePlayer();
+    const t2 = setTimeout(() => {
+      lg().warn("obtainMaster: 15s elapsed, nudge third time");
+      nudgePlayer();
     }, 15000);
-
-    let cap;
+    let cap2;
     try {
-      cap = await capturePromise;
+      cap2 = await promise;
     } finally {
-      clearTimeout(nudgeTimer1);
-      clearTimeout(nudgeTimer2);
+      clearTimeout(t1);
+      clearTimeout(t2);
     }
-
-    // Pause whatever started playing.
-    document.querySelectorAll("video").forEach((v) => {
-      try { v.pause(); } catch {}
-    });
-
-    return captureAndDownload({
-      masterUrl: cap.url,
-      quality,
-      targetFilename,
-      onProgress: (p) =>
-        onUpdate?.({
-          type: "lesson-progress",
-          title: lesson.title,
-          ...p,
-        }),
-    });
+    return { url: cap2.url, source: "fresh" };
   }
 
   // ===================================================================
-  // 7) Auto-walker
+  // Auto-walker
   // ===================================================================
 
+  let walkerRunning = false;
   let walkerAbort = false;
 
   async function runAutoWalker({ folderName, quality, onUpdate }) {
-    walkerAbort = false;
-    lg().info("walker: start", { folderName, quality });
-    const tree = scanClassroom();
-    const safeFolder = sanitizeForPath(folderName) || "Skool";
-    const safeClassroom = sanitizeForPath(tree.classroomName) || "Classroom";
-
-    const manifest = {
-      generatedAt: new Date().toISOString(),
-      folderName: safeFolder,
-      classroomName: tree.classroomName,
-      communityName: tree.communityName,
-      pageUrl: tree.pageUrl,
-      quality,
-      sections: [],
-    };
-
-    let total = 0;
-    tree.sections.forEach((s) => (total += s.lessons.length));
-    let processed = 0;
-    onUpdate?.({ type: "start", total, classroom: tree.classroomName });
-    lg().info("walker: tree summary", {
-      sections: tree.sections.length,
-      total,
-    });
-
-    if (total === 0) {
-      lg().error("walker: 0 lessons found, aborting");
-      onUpdate?.({ type: "lesson-error", error: "0 lessons found by scanner" });
-      onUpdate?.({ type: "all-done", manifest });
-      return manifest;
+    if (walkerRunning) {
+      lg().warn("walker: refused, already running");
+      throw new Error("walker is already running in this tab");
     }
+    walkerRunning = true;
+    walkerAbort = false;
+    try {
+      lg().info("walker: start", { folderName, quality });
+      const tree = scanClassroom();
+      const safeFolder = sanitizeForPath(folderName) || "Skool";
+      const safeClassroom = sanitizeForPath(tree.classroomName) || "Classroom";
 
-    for (const section of tree.sections) {
-      const sectionDir = `${pad(section.index)} - ${sanitizeForPath(
-        section.title
-      )}`;
-      const sectionEntry = {
-        index: section.index,
-        title: section.title,
-        lessons: [],
+      const manifest = {
+        generatedAt: new Date().toISOString(),
+        folderName: safeFolder,
+        classroomName: tree.classroomName,
+        communityName: tree.communityName,
+        pageUrl: tree.pageUrl,
+        quality,
+        sections: [],
       };
-      lg().info("walker: enter section", {
-        idx: section.index,
-        title: section.title,
-        lessons: section.lessons.length,
-      });
 
-      for (const lesson of section.lessons) {
-        if (walkerAbort) {
-          lg().warn("walker: abort flag set, exiting");
-          onUpdate?.({ type: "aborted" });
-          return manifest;
-        }
-        processed++;
-        const lessonFile = `${pad(lesson.index)} - ${sanitizeForPath(
-          lesson.title
-        )}.ts`;
-        const targetFilename = `${safeFolder}/${safeClassroom}/${sectionDir}/${lessonFile}`;
-        lg().info("walker: lesson begin", {
-          progress: `${processed}/${total}`,
-          title: lesson.title,
-          md: lesson.md,
-          targetFilename,
-        });
+      let total = 0;
+      tree.sections.forEach((s) => (total += s.lessons.length));
+      let processed = 0;
+      onUpdate?.({ type: "start", total, classroom: tree.classroomName });
 
-        onUpdate?.({
-          type: "lesson-start",
-          processed,
-          total,
-          section: section.title,
-          title: lesson.title,
-          file: targetFilename,
-        });
-
-        try {
-          await navigateToLesson(lesson.url);
-          const result = await processLesson({
-            lesson,
-            targetFilename,
-            quality,
-            onUpdate: (e) =>
-              onUpdate?.({
-                ...e,
-                processed,
-                total,
-              }),
-          });
-
-          sectionEntry.lessons.push({
-            index: lesson.index,
-            title: lesson.title,
-            md: lesson.md,
-            url: lesson.url,
-            file: targetFilename,
-            sizeBytes: result.sizeBytes,
-            status: "ok",
-          });
-          lg().info("walker: lesson done", {
-            title: lesson.title,
-            sizeBytes: result.sizeBytes,
-          });
-          onUpdate?.({
-            type: "lesson-done",
-            processed,
-            total,
-            title: lesson.title,
-            sizeBytes: result.sizeBytes,
-          });
-        } catch (e) {
-          lg().error("walker: lesson FAILED", {
-            title: lesson.title,
-            error: String(e?.message || e),
-            stack: String(e?.stack || "")
-              .split("\n")
-              .slice(0, 4)
-              .join(" | "),
-          });
-          sectionEntry.lessons.push({
-            index: lesson.index,
-            title: lesson.title,
-            md: lesson.md,
-            url: lesson.url,
-            file: targetFilename,
-            status: "error",
-            error: String(e?.message || e),
-          });
-          onUpdate?.({
-            type: "lesson-error",
-            processed,
-            total,
-            title: lesson.title,
-            error: String(e?.message || e),
-          });
-        }
-        await sleep(600);
+      if (total === 0) {
+        lg().error("walker: 0 lessons; aborting");
+        onUpdate?.({ type: "lesson-error", error: "0 lessons found" });
+        onUpdate?.({ type: "all-done", manifest });
+        return manifest;
       }
 
-      manifest.sections.push(sectionEntry);
+      for (const section of tree.sections) {
+        const sectionDir = `${pad(section.index)} - ${sanitizeForPath(
+          section.title
+        )}`;
+        const sectionEntry = {
+          index: section.index,
+          title: section.title,
+          lessons: [],
+        };
+
+        for (const lesson of section.lessons) {
+          if (walkerAbort) {
+            lg().warn("walker: abort requested, exiting");
+            onUpdate?.({ type: "aborted" });
+            return manifest;
+          }
+          processed++;
+          const lessonBase = `${pad(lesson.index)} - ${sanitizeForPath(
+            lesson.title
+          )}`;
+          const targetDir = `${safeFolder}/${safeClassroom}/${sectionDir}`;
+          const targetBase = lessonBase;
+          lg().info("walker: lesson begin", {
+            progress: `${processed}/${total}`,
+            title: lesson.title,
+            md: lesson.md,
+            targetDir,
+            targetBase,
+          });
+          onUpdate?.({
+            type: "lesson-start",
+            processed,
+            total,
+            section: section.title,
+            title: lesson.title,
+            file: `${targetDir}/${targetBase}`,
+          });
+
+          try {
+            await chrome.runtime.sendMessage({
+              type: "set-pending-lesson",
+              lessonId: lesson.md,
+            });
+
+            const navStartedAt = Date.now();
+            await navigateToLesson(lesson.url);
+            await sleep(800);
+            inspectPlayerDom();
+
+            const { url: masterUrl, source } = await obtainMasterUrl(
+              navStartedAt
+            );
+            lg().info("walker: master obtained", { source, processed });
+
+            // Pause whatever started playing.
+            document.querySelectorAll("video").forEach((v) => {
+              try { v.pause(); } catch {}
+            });
+
+            const result = await downloadLessonTracks({
+              masterUrl,
+              quality,
+              targetDir,
+              targetBase,
+              onProgress: (p) =>
+                onUpdate?.({
+                  type: "lesson-progress",
+                  processed,
+                  total,
+                  title: lesson.title,
+                  ...p,
+                }),
+            });
+
+            sectionEntry.lessons.push({
+              index: lesson.index,
+              title: lesson.title,
+              md: lesson.md,
+              url: lesson.url,
+              videoFile: result.videoFilename,
+              audioFile: result.audioFilename,
+              durationSec: result.durationSec,
+              resolution: result.resolution,
+              status: "ok",
+            });
+            lg().info("walker: lesson done", {
+              title: lesson.title,
+              totalBytes: result.totalBytes,
+            });
+            onUpdate?.({
+              type: "lesson-done",
+              processed,
+              total,
+              title: lesson.title,
+              sizeBytes: result.totalBytes,
+            });
+          } catch (e) {
+            lg().error("walker: lesson FAILED", {
+              title: lesson.title,
+              error: String(e?.message || e),
+              stack: String(e?.stack || "")
+                .split("\n")
+                .slice(0, 4)
+                .join(" | "),
+            });
+            sectionEntry.lessons.push({
+              index: lesson.index,
+              title: lesson.title,
+              md: lesson.md,
+              url: lesson.url,
+              status: "error",
+              error: String(e?.message || e),
+            });
+            onUpdate?.({
+              type: "lesson-error",
+              processed,
+              total,
+              title: lesson.title,
+              error: String(e?.message || e),
+            });
+          }
+          await sleep(800);
+        }
+        manifest.sections.push(sectionEntry);
+      }
+
+      await saveSidecarFiles({
+        folderName: safeFolder,
+        classroomName: safeClassroom,
+        manifest,
+      });
+
+      lg().info("walker: ALL DONE", {
+        sections: manifest.sections.length,
+        ok: manifest.sections
+          .flatMap((s) => s.lessons)
+          .filter((l) => l.status === "ok").length,
+        errors: manifest.sections
+          .flatMap((s) => s.lessons)
+          .filter((l) => l.status === "error").length,
+      });
+      onUpdate?.({ type: "all-done", manifest });
+      return manifest;
+    } finally {
+      walkerRunning = false;
     }
-
-    await saveSidecarFiles({
-      folderName: safeFolder,
-      classroomName: safeClassroom,
-      manifest,
-    });
-
-    lg().info("walker: ALL DONE", {
-      sections: manifest.sections.length,
-      ok: manifest.sections
-        .flatMap((s) => s.lessons)
-        .filter((l) => l.status === "ok").length,
-      errors: manifest.sections
-        .flatMap((s) => s.lessons)
-        .filter((l) => l.status === "error").length,
-    });
-    onUpdate?.({ type: "all-done", manifest });
-    return manifest;
   }
 
   function abortWalker() {
     walkerAbort = true;
-    lg().warn("walker: abort requested");
+    lg().warn("walker: abort flagged");
   }
 
   // ===================================================================
-  // 8) Manual: capture & download current lesson only
+  // Manual: capture & download current lesson only
   // ===================================================================
 
   async function captureCurrent({ folderName, quality, onUpdate }) {
-    lg().info("manual: start", {
-      folderName,
-      quality,
-      url: location.href,
-    });
+    if (walkerRunning) throw new Error("walker is currently running");
+    lg().info("manual: start", { folderName, quality, url: location.href });
     const tree = scanClassroom();
     const safeFolder = sanitizeForPath(folderName) || "Skool";
     const safeClassroom = sanitizeForPath(tree.classroomName) || "Classroom";
@@ -823,77 +841,80 @@
         title: lesson.sectionTitle || "Manual",
       };
 
-    const targetFilename = `${safeFolder}/${safeClassroom}/${pad(
+    const targetDir = `${safeFolder}/${safeClassroom}/${pad(
       section.index
-    )} - ${sanitizeForPath(section.title)}/${pad(
-      lesson.index || 1
-    )} - ${sanitizeForPath(lesson.title)}.ts`;
+    )} - ${sanitizeForPath(section.title)}`;
+    const targetBase = `${pad(lesson.index || 1)} - ${sanitizeForPath(
+      lesson.title
+    )}`;
 
-    lg().info("manual: target", { targetFilename, lesson, section });
     onUpdate?.({
       type: "lesson-start",
       processed: 1,
       total: 1,
       title: lesson.title,
-      file: targetFilename,
+      file: `${targetDir}/${targetBase}`,
     });
 
-    // Use existing capture if we have one, otherwise process from scratch.
-    let cap = await chrome.runtime.sendMessage({ type: "get-capture" });
-    lg().info("manual: existing capture?", { hasCapture: !!cap?.masterUrl });
+    await chrome.runtime.sendMessage({
+      type: "set-pending-lesson",
+      lessonId: lesson.md,
+    });
+    const navStartedAt = Date.now();
+    inspectPlayerDom();
+    const { url: masterUrl } = await obtainMasterUrl(navStartedAt);
 
-    let result;
-    if (cap?.masterUrl) {
-      result = await captureAndDownload({
-        masterUrl: cap.masterUrl,
-        quality,
-        targetFilename,
-        onProgress: (p) => onUpdate?.({ type: "lesson-progress", ...p }),
-      });
-    } else {
-      result = await processLesson({
-        lesson,
-        targetFilename,
-        quality,
-        onUpdate,
-      });
-    }
+    const result = await downloadLessonTracks({
+      masterUrl,
+      quality,
+      targetDir,
+      targetBase,
+      onProgress: (p) => onUpdate?.({ type: "lesson-progress", ...p }),
+    });
+
+    // Drop a tiny remux script just for this single lesson.
+    await saveSidecarFiles({
+      folderName: safeFolder,
+      classroomName: safeClassroom,
+      manifest: null, // skip writing _manifest.json for single lessons
+    });
 
     onUpdate?.({
       type: "lesson-done",
       processed: 1,
       total: 1,
       title: lesson.title,
-      sizeBytes: result.sizeBytes,
+      sizeBytes: result.totalBytes,
     });
     onUpdate?.({ type: "all-done" });
-    lg().info("manual: done", { sizeBytes: result.sizeBytes });
     return { ok: true };
   }
 
   // ===================================================================
-  // 9) Sidecar files
+  // Sidecar files: _manifest.json and _remux.sh
   // ===================================================================
 
   async function saveSidecarFiles({ folderName, classroomName, manifest }) {
     const base = `${folderName}/${classroomName}`;
-    lg().info("sidecar: writing _manifest.json + _remux.sh", { base });
 
-    const manifestBlob = new Blob([JSON.stringify(manifest, null, 2)], {
-      type: "application/json",
-    });
-    const manifestUrl = URL.createObjectURL(manifestBlob);
-    await chrome.runtime.sendMessage({
-      type: "download",
-      url: manifestUrl,
-      filename: `${base}/_manifest.json`,
-      conflictAction: "overwrite",
-    });
-    setTimeout(() => URL.revokeObjectURL(manifestUrl), 5000);
+    if (manifest) {
+      const manifestBlob = new Blob([JSON.stringify(manifest, null, 2)], {
+        type: "application/json",
+      });
+      const manifestUrl = URL.createObjectURL(manifestBlob);
+      await chrome.runtime.sendMessage({
+        type: "download",
+        url: manifestUrl,
+        filename: `${base}/_manifest.json`,
+        conflictAction: "overwrite",
+      });
+      setTimeout(() => URL.revokeObjectURL(manifestUrl), 5000);
+    }
 
     const sh = `#!/usr/bin/env bash
-# _remux.sh — converts every .ts file under this directory to .mp4 (lossless)
-# using ffmpeg stream copy. Generated by Skool Classroom Downloader.
+# _remux.sh — merges every <lesson>.video.mp4 + <lesson>.audio.mp4 pair
+# into a single <lesson>.mp4 using ffmpeg stream copy (lossless, ~instant).
+# Generated by Skool Classroom Downloader.
 
 set -euo pipefail
 HERE="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
@@ -905,19 +926,38 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
 fi
 
 shopt -s globstar nullglob
-count=0
-for ts in **/*.ts; do
-  mp4="\${ts%.ts}.mp4"
-  if [ -f "$mp4" ]; then
-    echo "skip (already exists): $mp4"
+merged=0
+videoonly=0
+for video in **/*.video.mp4; do
+  base="\${video%.video.mp4}"
+  audio="\${base}.audio.mp4"
+  out="\${base}.mp4"
+  if [ -f "$out" ]; then
+    echo "skip (exists): $out"
     continue
   fi
-  echo "remuxing: $ts -> $mp4"
-  ffmpeg -hide_banner -loglevel error -y -i "$ts" -c copy -bsf:a aac_adtstoasc "$mp4"
-  count=$((count+1))
+  if [ -f "$audio" ]; then
+    echo "merging: $base.{video,audio}.mp4 -> $out"
+    ffmpeg -hide_banner -loglevel error -y -i "$video" -i "$audio" -c copy -movflags +faststart "$out"
+    merged=$((merged+1))
+  else
+    echo "video-only (no audio file): $video -> $out"
+    ffmpeg -hide_banner -loglevel error -y -i "$video" -c copy -movflags +faststart "$out"
+    videoonly=$((videoonly+1))
+  fi
 done
 
-echo "Done. Remuxed $count file(s)."
+# Also remux any plain .ts artifacts from previous versions (safe no-op if absent).
+for ts in **/*.ts; do
+  out="\${ts%.ts}.mp4"
+  [ -f "$out" ] && continue
+  echo "remuxing legacy .ts: $ts -> $out"
+  ffmpeg -hide_banner -loglevel error -y -i "$ts" -c copy -bsf:a aac_adtstoasc "$out"
+done
+
+echo
+echo "Done. merged=$merged  videoonly=$videoonly"
+echo "Originals kept; delete .video.mp4 / .audio.mp4 / .ts manually when satisfied."
 `;
     const shBlob = new Blob([sh], { type: "text/x-shellscript" });
     const shUrl = URL.createObjectURL(shBlob);
@@ -931,7 +971,7 @@ echo "Done. Remuxed $count file(s)."
   }
 
   // ===================================================================
-  // 10) Message handler
+  // Message handler
   // ===================================================================
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -939,24 +979,20 @@ echo "Done. Remuxed $count file(s)."
       try {
         switch (msg?.type) {
           case "ping":
-            lg().debug("recv: ping");
             sendResponse({ ok: true, classroom: detectClassroomName() });
             return;
 
           case "scan":
-            lg().info("recv: scan");
             sendResponse({ ok: true, tree: scanClassroom() });
             return;
 
           case "inspect-player": {
-            lg().info("recv: inspect-player");
             const summary = inspectPlayerDom();
             sendResponse({ ok: true, summary });
             return;
           }
 
           case "nudge-player": {
-            lg().info("recv: nudge-player");
             const tried = nudgePlayer();
             sendResponse({ ok: true, tried });
             return;
@@ -966,7 +1002,15 @@ echo "Done. Remuxed $count file(s)."
             lg().info("recv: start-walker", {
               folderName: msg.folderName,
               quality: msg.quality,
+              alreadyRunning: walkerRunning,
             });
+            if (walkerRunning) {
+              sendResponse({
+                ok: false,
+                error: "walker is already running in this tab",
+              });
+              return;
+            }
             const onUpdate = (evt) => {
               chrome.runtime
                 .sendMessage({ type: "walker-progress", evt })
@@ -987,10 +1031,6 @@ echo "Done. Remuxed $count file(s)."
             return;
 
           case "capture-current": {
-            lg().info("recv: capture-current", {
-              folderName: msg.folderName,
-              quality: msg.quality,
-            });
             const onUpdate = (evt) =>
               chrome.runtime
                 .sendMessage({ type: "walker-progress", evt })
