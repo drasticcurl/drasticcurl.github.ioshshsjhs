@@ -1,44 +1,48 @@
-// background.js — Service worker for Skool Classroom Downloader (MV3)
-//
-// Responsibilities:
-//   1. Listen via chrome.webRequest for HLS master playlist URLs (.m3u8) on
-//      stream.video.skool.com so the moment a Skool video starts playing we
-//      capture its short-lived signed URL.
-//   2. Relay messages between the popup and the content script.
-//   3. Trigger downloads via chrome.downloads.download when the content
-//      script hands us blob URLs of the concatenated .ts files.
-//
-// State is per-tab because the user may have several Skool tabs open.
+// background.js — Service worker for Skool Classroom Downloader (MV3).
+
+import { createLogger, formatEntries } from "./lib/logger.js";
+
+const log = createLogger("bg");
+
+log.info("service worker booted", {
+  version: chrome.runtime.getManifest().version,
+  ts: new Date().toISOString(),
+});
 
 const captures = new Map(); // tabId -> { masterUrl, capturedAt, lessonId }
 
 /**
- * webRequest fires for every network request. We watch only the Skool video
- * CDN host(s). The first .m3u8 we see on a tab after a "play" event is the
- * master playlist with a fresh JWT token. We stash it keyed by tab.
+ * Watch every .m3u8 request on the Skool video CDNs. The first one we see
+ * after a "play" event has a fresh JWT token; we stash it per-tab so the
+ * content script can read it.
  */
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
     if (details.tabId < 0) return;
     if (!/\.m3u8(\?|$)/i.test(details.url)) return;
 
-    // We only care about the master / rendition playlists, not segment .ts.
+    const prev = captures.get(details.tabId) ?? {};
     captures.set(details.tabId, {
       masterUrl: details.url,
       capturedAt: Date.now(),
-      // lessonId is set later when the content script tells us which md= it
-      // was navigating to.
-      lessonId: captures.get(details.tabId)?.lessonId ?? null,
+      lessonId: prev.lessonId ?? null,
     });
 
-    // Notify content script (it may be awaiting capture in the auto-walker).
+    log.info("m3u8 captured via webRequest", {
+      tabId: details.tabId,
+      lessonId: prev.lessonId,
+      method: details.method,
+      type: details.type,
+      url: details.url,
+    });
+
     chrome.tabs
       .sendMessage(details.tabId, {
         type: "m3u8-captured",
         url: details.url,
         capturedAt: Date.now(),
       })
-      .catch(() => {});
+      .catch((e) => log.debug("could not notify content of capture", { e: String(e) }));
   },
   {
     urls: [
@@ -50,48 +54,51 @@ chrome.webRequest.onSendHeaders.addListener(
   ["requestHeaders"]
 );
 
-/**
- * Message router.
- *  - "set-pending-lesson"  (content -> bg): tell us which lesson we're about
- *                                            to navigate to so the next m3u8
- *                                            is associated correctly.
- *  - "get-capture"         (content/popup -> bg): return current capture for
- *                                                  the tab.
- *  - "download"            (content -> bg): { url, filename } -> trigger
- *                                            chrome.downloads.download.
- *  - "clear-capture"       (content -> bg): wipe stored capture for a tab.
- */
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const tabId = sender.tab?.id;
+  log.debug("onMessage", { type: msg?.type, fromTab: tabId });
 
   switch (msg?.type) {
     case "set-pending-lesson": {
-      if (tabId == null) break;
+      if (tabId == null) {
+        sendResponse({ ok: false, error: "no tabId" });
+        break;
+      }
       const cur = captures.get(tabId) ?? {};
       captures.set(tabId, {
         ...cur,
         lessonId: msg.lessonId,
-        masterUrl: null, // reset so we know the next m3u8 is for this lesson
+        masterUrl: null,
         capturedAt: null,
       });
+      log.info("set-pending-lesson", { tabId, lessonId: msg.lessonId });
       sendResponse({ ok: true });
       break;
     }
 
     case "get-capture": {
       const targetTabId = msg.tabId ?? tabId;
-      sendResponse(captures.get(targetTabId) ?? null);
+      const cap = captures.get(targetTabId) ?? null;
+      log.debug("get-capture", { tabId: targetTabId, hasCapture: !!cap });
+      sendResponse(cap);
       break;
     }
 
     case "clear-capture": {
-      if (tabId != null) captures.delete(tabId);
+      if (tabId != null) {
+        captures.delete(tabId);
+        log.info("clear-capture", { tabId });
+      }
       sendResponse({ ok: true });
       break;
     }
 
     case "download": {
-      // msg = { url, filename, conflictAction? }
+      log.info("download requested", {
+        filename: msg.filename,
+        urlPrefix: String(msg.url).slice(0, 30),
+        conflictAction: msg.conflictAction,
+      });
       chrome.downloads
         .download({
           url: msg.url,
@@ -100,14 +107,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           saveAs: false,
         })
         .then(
-          (id) => sendResponse({ ok: true, downloadId: id }),
-          (err) => sendResponse({ ok: false, error: String(err) })
+          (id) => {
+            log.info("download started", { downloadId: id, filename: msg.filename });
+            sendResponse({ ok: true, downloadId: id });
+          },
+          (err) => {
+            log.error("download failed", { filename: msg.filename, error: String(err) });
+            sendResponse({ ok: false, error: String(err) });
+          }
         );
-      return true; // keep the channel open for async response
+      return true;
+    }
+
+    case "get-bg-logs": {
+      sendResponse({ ok: true, entries: log.getEntries() });
+      break;
     }
 
     case "popup-relay": {
-      // popup -> bg -> content of active tab
       (async () => {
         try {
           const [tab] = await chrome.tabs.query({
@@ -115,12 +132,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             currentWindow: true,
           });
           if (!tab) {
+            log.warn("popup-relay: no active tab");
             sendResponse({ ok: false, error: "no active tab" });
             return;
           }
+          log.debug("popup-relay -> content", {
+            tabId: tab.id,
+            inner: msg.payload?.type,
+          });
           const reply = await chrome.tabs.sendMessage(tab.id, msg.payload);
           sendResponse({ ok: true, reply, tabId: tab.id });
         } catch (e) {
+          log.error("popup-relay error", { error: String(e) });
           sendResponse({ ok: false, error: String(e) });
         }
       })();
@@ -129,5 +152,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
-// Clean up captures when tabs close.
-chrome.tabs.onRemoved.addListener((tabId) => captures.delete(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (captures.delete(tabId)) log.info("tab closed, capture cleared", { tabId });
+});
+
+// Log unhandled errors from inside the SW for visibility.
+self.addEventListener("error", (e) => {
+  log.error("sw error event", { message: e.message, filename: e.filename, lineno: e.lineno });
+});
+self.addEventListener("unhandledrejection", (e) => {
+  log.error("sw unhandledrejection", { reason: String(e.reason) });
+});
+
+// Tiny export so debugging scripts in the SW console can call it.
+self.__skoolDLDumpLogs = () => formatEntries(log.getEntries());

@@ -184,6 +184,30 @@ header h1 {
   color: var(--danger);
 }
 
+.debug {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.debug button {
+  background: var(--bg-elev);
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 8px;
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.debug button:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+#copyHint {
+  font-size: 10px;
+  color: var(--ok);
+}
+
 footer p {
   font-size: 10px;
 }

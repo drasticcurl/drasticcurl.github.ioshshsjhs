@@ -10,6 +10,9 @@
 // All fetches are performed from the caller's origin (the content script
 // runs on www.skool.com so Origin/Referer are correct automatically).
 
+import { createLogger } from "./logger.js";
+const log = createLogger("hls");
+
 /**
  * Parse a master playlist and return the list of variants.
  * @param {string} text raw .m3u8 content
@@ -117,20 +120,34 @@ export async function downloadSegments(
       if (signal?.aborted) throw new Error("aborted");
       const url = segmentUrls[i];
       let attempt = 0;
-      // simple retry: 3 attempts with backoff
       while (true) {
         try {
           const resp = await fetch(url, {
             credentials: "include",
             referrer: "https://www.skool.com/",
           });
-          if (!resp.ok) throw new Error("HTTP " + resp.status);
+          if (!resp.ok) {
+            log.warn("segment HTTP error", {
+              idx: i,
+              status: resp.status,
+              attempt: attempt + 1,
+            });
+            throw new Error("HTTP " + resp.status);
+          }
           const buf = new Uint8Array(await resp.arrayBuffer());
           chunks[i] = buf;
           break;
         } catch (e) {
           attempt++;
-          if (attempt >= 3) throw e;
+          log.warn("segment fetch failed", {
+            idx: i,
+            attempt,
+            error: String(e?.message || e),
+          });
+          if (attempt >= 3) {
+            log.error("segment giving up", { idx: i, url: url.slice(0, 100) });
+            throw e;
+          }
           await sleep(500 * attempt);
         }
       }
@@ -159,13 +176,32 @@ export async function downloadSegments(
  * Fetch a playlist (master or rendition) and return its text.
  */
 export async function fetchPlaylist(url) {
-  const resp = await fetch(url, {
-    credentials: "include",
-    referrer: "https://www.skool.com/",
-  });
-  if (!resp.ok) throw new Error(`Playlist HTTP ${resp.status}`);
+  log.debug("fetchPlaylist", { url: String(url).slice(0, 120) });
+  let resp;
+  try {
+    resp = await fetch(url, {
+      credentials: "include",
+      referrer: "https://www.skool.com/",
+    });
+  } catch (e) {
+    log.error("fetchPlaylist network error", {
+      error: String(e?.message || e),
+      url: String(url).slice(0, 120),
+    });
+    throw e;
+  }
+  if (!resp.ok) {
+    log.error("fetchPlaylist HTTP error", {
+      status: resp.status,
+      url: String(url).slice(0, 120),
+    });
+    throw new Error(`Playlist HTTP ${resp.status}`);
+  }
   return resp.text();
 }
+
+/** Expose the logger so callers can append entries (debug only). */
+export const _log = log;
 
 // --- helpers ---
 
