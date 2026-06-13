@@ -291,6 +291,80 @@
   }
 
   /**
+   * The playback ID Skool uses for the lesson we are currently trying to
+   * capture. Set by obtainMasterUrl so the m3u8-captured handler only
+   * resolves on the matching master (prevents reusing a previous lesson's
+   * video when the walker moves fast).
+   */
+  let expectedPlaybackId = null;
+
+  /** Extract the Mux playback ID from a master URL, or null. */
+  function playbackIdFromMaster(url) {
+    const m = /stream\.video\.skool\.com\/([^\/.?]+)\.m3u8/i.exec(url || "");
+    return m ? m[1] : null;
+  }
+
+  /**
+   * Determine the playback ID for the lesson currently shown, by reading
+   * the DOM (mux-player attribute, or the thumbnail image URL which embeds
+   * the same ID). Returns null if it can't be found.
+   */
+  function getExpectedPlaybackId() {
+    // 1) thumbnail/poster background-image reflects the CURRENTLY shown
+    //    lesson (present right after SPA navigation, before the player
+    //    mounts) — image.video.skool.com/<ID>/thumbnail...
+    const thumb = document.querySelector('[class*="ThumbnailImage" i]');
+    if (thumb) {
+      const bg =
+        thumb.style?.backgroundImage ||
+        getComputedStyle(thumb).backgroundImage ||
+        "";
+      const m = /image\.video\.skool\.com\/([^\/]+)\/(?:thumbnail|storyboard)/i.exec(
+        bg
+      );
+      if (m) return m[1];
+    }
+
+    // 2) a mounted mux-player exposes it directly (lesson currently playing)
+    const mp = document.querySelector("mux-player, mux-video");
+    const attr = mp?.getAttribute?.("playback-id");
+    if (attr) return attr;
+
+    // 3) anywhere in the player wrapper's markup
+    const wrap = document.querySelector(
+      '[class*="MuxThumbnail" i], [class*="MuxPlayer" i]'
+    );
+    if (wrap) {
+      const m = /image\.video\.skool\.com\/([^\/"'&]+)\/(?:thumbnail|storyboard)/i.exec(
+        wrap.outerHTML || ""
+      );
+      if (m) return m[1];
+    }
+    return null;
+  }
+
+  /** Mute + pause every <video>, including ones inside open shadow DOM. */
+  function pauseAllVideos() {
+    const stop = (v) => {
+      try {
+        v.muted = true;
+        v.pause();
+      } catch {}
+    };
+    document.querySelectorAll("video").forEach(stop);
+    const dv = findDeepVideo();
+    if (dv) stop(dv);
+    // Also try to pause the mux-player host directly.
+    const mp = document.querySelector("mux-player, mux-video");
+    if (mp) {
+      try {
+        mp.muted = true;
+        mp.pause?.();
+      } catch {}
+    }
+  }
+
+  /**
    * Recursively walk shadow roots looking for a <video> element. Returns
    * the first one found, or null. mux-player wraps several layers of
    * shadow DOM so the native <video> is several levels deep once mounted.
@@ -511,7 +585,8 @@
     // class and walk up to a sizable ancestor.
     const all = Array.from(
       document.querySelectorAll(
-        '[class*="MuxPlayer" i], [class*="VideoPlayer" i], [class*="VideoPoster" i], ' +
+        '[class*="MuxThumbnail" i], [class*="ThumbnailImage" i], ' +
+          '[class*="MuxPlayer" i], [class*="VideoPlayer" i], [class*="VideoPoster" i], ' +
           '[class*="VideoThumb" i], [class*="VideoPreview" i], ' +
           '[class*="VideoContainer" i], [class*="VideoFrame" i], ' +
           '[class*="VideoWrapper" i], [class*="VideoDuration" i]'
@@ -709,35 +784,51 @@
   // ===================================================================
 
   /**
-   * After a navigation, try to obtain a master m3u8 URL for the current
-   * lesson. Returns { url, source }.
-   *  - Strategy A: ask bg if we already have a recent master (< 5 min
-   *    old) AND it was captured AT OR AFTER nav started → reuse it.
-   *  - Strategy B: nudge the player and await a fresh capture (45s).
+   * After a navigation, obtain a master m3u8 URL that belongs to THIS
+   * lesson, identified by playback ID read from the DOM.
+   *
+   * Returns { url, source, pid }.
+   *
+   * - We never reuse a capture whose playback ID doesn't match the lesson
+   *   currently shown — that was the v0.4 bug where the walker reused the
+   *   previous lesson's master (same URL for lessons 3..10).
+   * - If the bg already holds a master for the expected playback ID, use it.
+   * - Otherwise nudge the player to mount + play so Skool fires the
+   *   manifest, and await a capture whose playback ID matches.
    */
-  async function obtainMasterUrl(navStartedAt, attempts = 3) {
-    // Strategy A
+  async function obtainMasterUrl(navStartedAt) {
+    const expectedId = getExpectedPlaybackId();
+    expectedPlaybackId = expectedId;
+    lg().info("obtainMaster: expected playback id", { expectedId });
+
+    // Strategy A: reuse only if the stored master matches the expected ID.
     const cap = await chrome.runtime.sendMessage({ type: "get-capture" });
-    if (cap?.masterUrl && cap?.masterAt) {
-      const age = Date.now() - cap.masterAt;
-      if (age < 5 * 60 * 1000) {
-        // Reuse if either: captured AFTER we started this nav, OR captured
-        // within the last 60s (probably the user just opened the lesson
-        // before clicking "auto-walk").
-        if (cap.masterAt >= navStartedAt - 1000 || age < 60000) {
-          lg().info("obtainMaster: reusing existing capture", {
-            ageMs: age,
-            capturedAt: new Date(cap.masterAt).toISOString(),
-          });
-          return { url: cap.masterUrl, source: "reused" };
-        }
-        lg().debug("obtainMaster: existing capture too old for this nav", {
-          ageMs: age,
+    if (cap?.masterUrl) {
+      const pid = playbackIdFromMaster(cap.masterUrl);
+      const fresh = cap.masterAt && Date.now() - cap.masterAt < 5 * 60 * 1000;
+      if (fresh && expectedId && pid === expectedId) {
+        lg().info("obtainMaster: reusing matching capture", {
+          pid,
+          ageMs: Date.now() - cap.masterAt,
         });
+        expectedPlaybackId = null;
+        return { url: cap.masterUrl, source: "reused", pid };
       }
+      // If we don't know the expected ID, fall back to the old time-based
+      // reuse (only when captured at/after this nav).
+      if (fresh && !expectedId && cap.masterAt >= navStartedAt - 1000) {
+        lg().warn("obtainMaster: reusing by timing (no expected id)", {
+          pid,
+        });
+        return { url: cap.masterUrl, source: "reused-timing", pid };
+      }
+      lg().debug("obtainMaster: stored capture not usable", {
+        storedPid: pid,
+        expectedId,
+      });
     }
 
-    // Strategy B
+    // Strategy B: nudge + await a capture whose pid matches expectedId.
     const promise = awaitNextCapture(45000);
     nudgePlayer();
     const t1 = setTimeout(() => {
@@ -754,8 +845,13 @@
     } finally {
       clearTimeout(t1);
       clearTimeout(t2);
+      expectedPlaybackId = null;
     }
-    return { url: cap2.url, source: "fresh" };
+    return {
+      url: cap2.url,
+      source: "fresh",
+      pid: playbackIdFromMaster(cap2.url),
+    };
   }
 
   // ===================================================================
@@ -854,10 +950,9 @@
             );
             lg().info("walker: master obtained", { source, processed });
 
-            // Pause whatever started playing.
-            document.querySelectorAll("video").forEach((v) => {
-              try { v.pause(); } catch {}
-            });
+            // Stop playback (mute + pause, including deep shadow-DOM video)
+            // so we don't end up with every lesson blaring at once.
+            pauseAllVideos();
 
             const result = await downloadLessonTracks({
               masterUrl,
@@ -1190,7 +1285,17 @@ echo "Originals kept; delete .video.mp4 / .audio.mp4 / .ts manually when satisfi
 
           case "m3u8-captured":
             lg().info("recv: m3u8-captured", { url: msg.url });
-            if (pendingCapture) pendingCapture.resolve(msg);
+            if (pendingCapture) {
+              const pid = playbackIdFromMaster(msg.url);
+              if (!expectedPlaybackId || pid === expectedPlaybackId) {
+                pendingCapture.resolve(msg);
+              } else {
+                lg().debug("ignoring captured master: pid mismatch", {
+                  capturedPid: pid,
+                  expected: expectedPlaybackId,
+                });
+              }
+            }
             return;
         }
       } catch (e) {
