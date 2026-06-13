@@ -236,17 +236,103 @@
         };
       });
 
+    // Walk shadow roots (open ones — mux-player, media-chrome use these).
+    const shadowRoots = [];
+    const visited = new WeakSet();
+    function visit(root, depth, hostLabel) {
+      if (!root || visited.has(root) || depth > 6) return;
+      visited.add(root);
+      const kids = Array.from(root.children || []).map((c) =>
+        c.tagName.toLowerCase()
+      );
+      const hasVideo = !!root.querySelector?.("video");
+      shadowRoots.push({
+        host: hostLabel,
+        childTags: kids.slice(0, 12),
+        hasVideo,
+        depth,
+      });
+      Array.from(root.querySelectorAll?.("*") || []).forEach((el) => {
+        if (el.shadowRoot) {
+          visit(el.shadowRoot, depth + 1, el.tagName.toLowerCase());
+        }
+      });
+    }
+    document.querySelectorAll("*").forEach((el) => {
+      if (el.shadowRoot) {
+        visit(el.shadowRoot, 0, el.tagName.toLowerCase());
+      }
+    });
+
+    // The deep video, if any.
+    const deepVideo = findDeepVideo();
+    const deepVideoInfo = deepVideo
+      ? {
+          src: deepVideo.currentSrc || deepVideo.src || null,
+          readyState: deepVideo.readyState,
+          paused: deepVideo.paused,
+          duration: deepVideo.duration,
+        }
+      : null;
+
     const summary = {
       url: location.href,
       iframes,
       videos,
+      deepVideo: deepVideoInfo,
       customElCount: customEls.length,
       customElTypes: customElTypes.slice(0, 30),
       muxLike: customElTypes.filter((t) => /mux|player|video|hls/i.test(t)),
       playerLike,
+      shadowRoots,
     };
     lg().info("inspectPlayerDom", summary);
     return summary;
+  }
+
+  /**
+   * Recursively walk shadow roots looking for a <video> element. Returns
+   * the first one found, or null. mux-player wraps several layers of
+   * shadow DOM so the native <video> is several levels deep once mounted.
+   */
+  function findDeepVideo(root = document) {
+    const direct = root.querySelector?.("video");
+    if (direct) return direct;
+    const all = root.querySelectorAll?.("*") || [];
+    for (const el of all) {
+      if (el.shadowRoot) {
+        const found = findDeepVideo(el.shadowRoot);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Recursively look for a play button inside open shadow DOMs. Returns
+   * the first matching element. mux-player exposes its play button via
+   * shadow DOM with [part="play"] or as <media-play-button>.
+   */
+  function findDeepPlayButton(root = document) {
+    const sels = [
+      '[part~="play"]',
+      'media-play-button',
+      'button[aria-label*="play" i]',
+      'button[aria-label*="reproducir" i]',
+      'button[title*="play" i]',
+    ];
+    for (const sel of sels) {
+      const el = root.querySelector?.(sel);
+      if (el) return el;
+    }
+    const all = root.querySelectorAll?.("*") || [];
+    for (const el of all) {
+      if (el.shadowRoot) {
+        const found = findDeepPlayButton(el.shadowRoot);
+        if (found) return found;
+      }
+    }
+    return null;
   }
 
   // ===================================================================
@@ -287,32 +373,58 @@
   function nudgePlayer() {
     const tried = [];
 
-    // 1) <video> in main doc
-    const v = document.querySelector("video");
-    if (v) {
+    // ---- A) <mux-player> mounted: this is the easy path
+    const mp = document.querySelector("mux-player, mux-video");
+    if (mp) {
       try {
-        v.muted = true;
-        v.play()?.catch?.(() => {});
+        // Force muted BEFORE play so Chrome's autoplay policy doesn't block.
+        mp.muted = true;
+        mp.setAttribute("muted", "");
+        mp.setAttribute("autoplay", "");
+        const p = mp.play?.();
+        if (p && typeof p.catch === "function") p.catch(() => {});
+        tried.push("mux-player.muted+play()");
+      } catch (e) {
+        tried.push("mux-player.play()→threw:" + String(e?.message || e));
+      }
+
+      // Click the deep play button inside shadow DOM.
+      const playBtn = findDeepPlayButton(mp);
+      if (playBtn) {
+        try {
+          playBtn.click();
+          tried.push("deepPlayBtn.click:" + (playBtn.tagName || "?"));
+        } catch {}
+      }
+
+      // If a real <video> is mounted somewhere deep, mute+play it directly.
+      const deepV = findDeepVideo(mp);
+      if (deepV) {
+        try {
+          deepV.muted = true;
+          const pp = deepV.play();
+          if (pp && pp.catch) pp.catch(() => {});
+          tried.push("deepVideo.play()");
+        } catch {}
+      }
+    }
+
+    // ---- B) <video> already in main doc (rare but cheap to try)
+    const directV = document.querySelector("video");
+    if (directV) {
+      try {
+        directV.muted = true;
+        directV.play()?.catch?.(() => {});
         tried.push("video.play()");
       } catch {}
     }
 
-    // 2) mux-player web component already mounted
-    const mp = document.querySelector("mux-player, mux-video");
-    if (mp) {
-      try {
-        mp.muted = true;
-        mp.play?.()?.catch?.(() => {});
-        tried.push("mux-player.play()");
-      } catch {}
-    }
-
-    // 3) Same-origin iframes (rare but possible)
+    // ---- C) Same-origin iframes (also rare)
     document.querySelectorAll("iframe").forEach((f, i) => {
       try {
         const doc = f.contentDocument;
         if (!doc) return;
-        const innerV = doc.querySelector("video");
+        const innerV = findDeepVideo(doc);
         if (innerV) {
           innerV.muted = true;
           innerV.play()?.catch?.(() => {});
@@ -321,18 +433,37 @@
       } catch {}
     });
 
-    // 4) Find the largest "player-looking" element and click its center
+    // ---- D) Poster mode: mux-player not mounted yet. Click the poster
+    //         area to make Skool mount the player. We restrict button
+    //         hunting to within the player wrapper so we don't click
+    //         something unrelated (community switcher, etc.).
     const wrapper = findPlayerWrapper();
     if (wrapper) {
       wrapper.scrollIntoView({ block: "center", behavior: "instant" });
-      tried.push("scrollIntoView:" + (wrapper.className || "").toString().slice(0, 30));
+      tried.push(
+        "scrollIntoView:" + (wrapper.className || "").toString().slice(0, 30)
+      );
+
+      // Inside the wrapper, find a button or just dispatch a click at
+      // the wrapper's center via elementFromPoint.
+      const btnInside = wrapper.querySelector(
+        'button, [role="button"], [aria-label*="play" i], [data-testid*="play" i]'
+      );
+      if (btnInside) {
+        try {
+          btnInside.click();
+          tried.push(
+            "wrapper.btn.click:" +
+              (btnInside.getAttribute("aria-label") || btnInside.tagName)
+          );
+        } catch {}
+      }
 
       const r = wrapper.getBoundingClientRect();
       const cx = r.left + r.width / 2;
       const cy = r.top + r.height / 2;
       const target = document.elementFromPoint(cx, cy);
-      if (target) {
-        // Full mouse event sequence to fool any "real user click" guard
+      if (target && target !== wrapper) {
         for (const type of ["mouseover", "mousedown", "mouseup", "click"]) {
           try {
             target.dispatchEvent(
@@ -351,25 +482,11 @@
           "elementFromPoint.click:" +
             target.tagName +
             "." +
-            (target.className || "").toString().slice(0, 30)
+            ((target.className || "").toString().slice(0, 30) || "-")
         );
       }
-    }
-
-    // 5) Fallback: click any visible play-labeled button
-    const btn = Array.from(
-      document.querySelectorAll(
-        'button, [role="button"], [aria-label*="play" i], [aria-label*="reproducir" i], [data-testid*="play" i]'
-      )
-    ).find((b) => {
-      const r = b.getBoundingClientRect();
-      return r.width > 30 && r.height > 30;
-    });
-    if (btn) {
-      try {
-        btn.click();
-        tried.push("playBtn.click:" + (btn.getAttribute("aria-label") || btn.tagName));
-      } catch {}
+    } else {
+      tried.push("no-player-wrapper-found");
     }
 
     lg().info("nudgePlayer: tried", { tried });
@@ -377,6 +494,21 @@
   }
 
   function findPlayerWrapper() {
+    // Strategy 1: any <mux-player>/<mux-video> wrapper or its parent chain.
+    const mp = document.querySelector("mux-player, mux-video");
+    if (mp) {
+      // Use the closest reasonably-sized ancestor (or mp itself).
+      let cur = mp;
+      while (cur) {
+        const r = cur.getBoundingClientRect();
+        if (r.width >= 200 && r.height >= 100) return cur;
+        cur = cur.parentElement;
+      }
+      return mp;
+    }
+
+    // Strategy 2: poster mode. Find any element with a Video*-looking
+    // class and walk up to a sizable ancestor.
     const all = Array.from(
       document.querySelectorAll(
         '[class*="MuxPlayer" i], [class*="VideoPlayer" i], [class*="VideoPoster" i], ' +
@@ -385,33 +517,39 @@
           '[class*="VideoWrapper" i], [class*="VideoDuration" i]'
       )
     );
-    let best = null;
-    let bestArea = 0;
+    let seed = null;
+    let seedArea = 0;
     for (const el of all) {
       const r = el.getBoundingClientRect();
       const area = r.width * r.height;
-      if (r.width >= 200 && r.height >= 100 && area > bestArea) {
-        best = el;
-        bestArea = area;
+      if (r.width >= 50 && r.height >= 30 && area > seedArea) {
+        seed = el;
+        seedArea = area;
       }
     }
-    if (best) {
-      // Walk up to a parent up to ~80% of viewport, in case the matched el
-      // is a small label (like VideoDuration).
-      let cur = best;
-      while (cur.parentElement) {
-        const pr = cur.parentElement.getBoundingClientRect();
-        const pa = pr.width * pr.height;
-        if (
-          pr.width <= window.innerWidth * 0.95 &&
-          pr.height <= window.innerHeight * 0.9 &&
-          pa > bestArea * 1.1
-        ) {
+    if (!seed) return null;
+
+    // Walk up until we find an ancestor that is video-shaped (16:9-ish,
+    // wide and tall enough). Stop if we'd exceed ~95% of the viewport.
+    let best = seed;
+    let cur = seed;
+    while (cur && cur.parentElement) {
+      const pr = cur.parentElement.getBoundingClientRect();
+      if (
+        pr.width <= window.innerWidth * 0.95 &&
+        pr.height <= window.innerHeight * 0.9 &&
+        pr.width >= 300 &&
+        pr.height >= 150
+      ) {
+        // Prefer 16:9-ish containers
+        const ratio = pr.width / Math.max(1, pr.height);
+        if (ratio >= 1.2 && ratio <= 2.5 && pr.width * pr.height > best.getBoundingClientRect().width * best.getBoundingClientRect().height) {
           best = cur.parentElement;
-          bestArea = pa;
-          cur = cur.parentElement;
-        } else break;
+        }
       }
+      const r = cur.parentElement.getBoundingClientRect();
+      if (r.width > window.innerWidth * 0.95) break;
+      cur = cur.parentElement;
     }
     return best;
   }
