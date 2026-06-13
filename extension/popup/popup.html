@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Skool Downloader</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Skool Classroom Downloader</h1>
+      <p class="muted" id="status">Open a Skool classroom and click "Scan".</p>
+    </header>
+
+    <section class="form">
+      <label>
+        <span>Subfolder name (under <code>~/Downloads</code>)</span>
+        <input
+          type="text"
+          id="folderName"
+          placeholder="MyCourse"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </label>
+
+      <label>
+        <span>Quality</span>
+        <select id="quality">
+          <option value="max" selected>Max available</option>
+          <option value="1080">1080p</option>
+          <option value="720">720p</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="actions">
+      <button id="btnScan" type="button">1. Scan classroom</button>
+      <button id="btnWalker" type="button" disabled>2. Auto-download all</button>
+      <button id="btnCurrent" type="button">Download current lesson</button>
+      <button id="btnAbort" type="button" class="danger" disabled>Stop</button>
+    </section>
+
+    <section class="tree" id="tree" hidden>
+      <h2>Found in this classroom</h2>
+      <div id="treeBody"></div>
+    </section>
+
+    <section class="progress" id="progress" hidden>
+      <div class="bar"><div class="bar-fill" id="barFill"></div></div>
+      <div class="log" id="log"></div>
+    </section>
+
+    <section class="debug">
+      <button id="btnCopyLogs" type="button">Copy debug log</button>
+      <button id="btnSaveLogs" type="button">Save debug log to file</button>
+      <span class="muted" id="copyHint"></span>
+    </section>
+
+    <footer>
+      <p class="muted">
+        Files are saved as <code>.ts</code>. Run the bundled
+        <code>_remux.sh</code> with <code>ffmpeg</code> to convert to
+        <code>.mp4</code> losslessly. Use only for content you have access to.
+      </p>
+    </footer>
+
+    <script src="popup.js" type="module"></script>
+  </body>
+</html>

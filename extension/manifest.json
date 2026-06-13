@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "Skool Classroom Downloader",
+  "short_name": "Skool DL",
+  "version": "0.1.0",
+  "description": "Bulk-downloads videos from a Skool classroom (native HLS player) into ordered folders. For personal offline use of content you have legitimate access to.",
+  "minimum_chrome_version": "114",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "Skool Classroom Downloader",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "storage",
+    "downloads",
+    "tabs",
+    "scripting",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "*://*.skool.com/*",
+    "*://stream.video.skool.com/*",
+    "*://*.video.skool.com/*",
+    "*://*.fastly.video.skool.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["*://*.skool.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["lib/*.js"],
+      "matches": ["*://*.skool.com/*"]
+    }
+  ]
+}
