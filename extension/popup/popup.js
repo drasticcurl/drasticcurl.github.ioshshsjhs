@@ -151,6 +151,59 @@ btnAbort.addEventListener("click", async () => {
   appendLog("Stopping after current lesson…");
 });
 
+const btnInspect = $("#btnInspect");
+const btnNudge = $("#btnNudge");
+btnInspect.addEventListener("click", async () => {
+  log.info("button: inspect-player clicked");
+  showProgress();
+  try {
+    const { reply } = await relay({ type: "inspect-player" });
+    if (!reply?.ok) throw new Error(reply?.error || "inspect failed");
+    const s = reply.summary;
+    appendLog(
+      `iframes: ${s.iframes.length} | <video>: ${s.videos.length} | mux-like: ${
+        s.muxLike.join(", ") || "none"
+      }`
+    );
+    s.iframes.forEach((f, i) => {
+      appendLog(
+        `  iframe[${i}] ${f.w}x${f.h} sameOrigin=${f.sameOrigin} src=${
+          f.src ? f.src.slice(0, 60) : "(empty)"
+        }`
+      );
+    });
+    s.videos.forEach((v, i) => {
+      appendLog(
+        `  video[${i}] readyState=${v.readyState} paused=${v.paused} src=${
+          v.src ? v.src.slice(0, 60) : "(none)"
+        }`
+      );
+    });
+    s.playerCandidates.forEach((c, i) => {
+      appendLog(
+        `  cand[${i}] ${c.tag} testid=${c.testid || "-"} cls=${
+          c.cls ? c.cls.slice(0, 50) : "-"
+        }`
+      );
+    });
+    appendLog("Done. Use 'Copy debug log' to send full details.", "ok");
+  } catch (e) {
+    appendLog("Error: " + e.message, "err");
+  }
+});
+
+btnNudge.addEventListener("click", async () => {
+  log.info("button: nudge clicked");
+  showProgress();
+  try {
+    const { reply } = await relay({ type: "nudge-player" });
+    if (!reply?.ok) throw new Error(reply?.error || "nudge failed");
+    appendLog("Nudge tried: " + (reply.tried.join(", ") || "(nothing)"));
+  } catch (e) {
+    appendLog("Error: " + e.message, "err");
+  }
+});
+
 btnCopyLogs.addEventListener("click", async () => {
   await dumpLogs("copy");
 });

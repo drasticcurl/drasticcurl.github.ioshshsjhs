@@ -31,10 +31,7 @@
     "webRequest"
   ],
   "host_permissions": [
-    "*://*.skool.com/*",
-    "*://stream.video.skool.com/*",
-    "*://*.video.skool.com/*",
-    "*://*.fastly.video.skool.com/*"
+    "<all_urls>"
   ],
   "content_scripts": [
     {
