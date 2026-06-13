@@ -12,14 +12,19 @@ log.info("service worker booted", {
 const captures = new Map(); // tabId -> { masterUrl, capturedAt, lessonId }
 
 /**
- * Watch every .m3u8 request on the Skool video CDNs. The first one we see
- * after a "play" event has a fresh JWT token; we stash it per-tab so the
- * content script can read it.
+ * Watch every request on every URL. We filter inside the listener for
+ * anything that looks like an HLS playlist or video manifest. This
+ * intentionally broad scope was added in v0.2 because Skool's native player
+ * may be served from hosts other than *.video.skool.com (e.g. Mux directly).
  */
+function isVideoManifestUrl(u) {
+  return /\.m3u8(\?|$)/i.test(u) || /\/manifest[^?]*\.(m3u8|mpd)/i.test(u);
+}
+
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
     if (details.tabId < 0) return;
-    if (!/\.m3u8(\?|$)/i.test(details.url)) return;
+    if (!isVideoManifestUrl(details.url)) return;
 
     const prev = captures.get(details.tabId) ?? {};
     captures.set(details.tabId, {
@@ -28,7 +33,7 @@ chrome.webRequest.onSendHeaders.addListener(
       lessonId: prev.lessonId ?? null,
     });
 
-    log.info("m3u8 captured via webRequest", {
+    log.info("manifest captured via webRequest", {
       tabId: details.tabId,
       lessonId: prev.lessonId,
       method: details.method,
@@ -42,16 +47,30 @@ chrome.webRequest.onSendHeaders.addListener(
         url: details.url,
         capturedAt: Date.now(),
       })
-      .catch((e) => log.debug("could not notify content of capture", { e: String(e) }));
+      .catch((e) =>
+        log.debug("could not notify content of capture", { e: String(e) })
+      );
   },
-  {
-    urls: [
-      "*://stream.video.skool.com/*.m3u8*",
-      "*://*.video.skool.com/*.m3u8*",
-      "*://*.fastly.video.skool.com/*.m3u8*",
-    ],
-  },
+  { urls: ["<all_urls>"] },
   ["requestHeaders"]
+);
+
+// Also log every fetched URL that contains "video" or "stream" or "media"
+// for diagnostic purposes — many video CDN endpoints have those tokens.
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    if (details.tabId < 0) return;
+    const u = details.url;
+    if (!/(video|stream|media|mux|hls|playback)/i.test(u)) return;
+    if (isVideoManifestUrl(u)) return; // already logged above
+    log.debug("video-ish request seen", {
+      tabId: details.tabId,
+      type: details.type,
+      method: details.method,
+      url: u.length > 200 ? u.slice(0, 200) + "…" : u,
+    });
+  },
+  { urls: ["<all_urls>"] }
 );
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -108,11 +127,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         })
         .then(
           (id) => {
-            log.info("download started", { downloadId: id, filename: msg.filename });
+            log.info("download started", {
+              downloadId: id,
+              filename: msg.filename,
+            });
             sendResponse({ ok: true, downloadId: id });
           },
           (err) => {
-            log.error("download failed", { filename: msg.filename, error: String(err) });
+            log.error("download failed", {
+              filename: msg.filename,
+              error: String(err),
+            });
             sendResponse({ ok: false, error: String(err) });
           }
         );
@@ -153,16 +178,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (captures.delete(tabId)) log.info("tab closed, capture cleared", { tabId });
+  if (captures.delete(tabId))
+    log.info("tab closed, capture cleared", { tabId });
 });
 
-// Log unhandled errors from inside the SW for visibility.
 self.addEventListener("error", (e) => {
-  log.error("sw error event", { message: e.message, filename: e.filename, lineno: e.lineno });
+  log.error("sw error event", {
+    message: e.message,
+    filename: e.filename,
+    lineno: e.lineno,
+  });
 });
 self.addEventListener("unhandledrejection", (e) => {
   log.error("sw unhandledrejection", { reason: String(e.reason) });
 });
 
-// Tiny export so debugging scripts in the SW console can call it.
 self.__skoolDLDumpLogs = () => formatEntries(log.getEntries());
