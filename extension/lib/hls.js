@@ -198,7 +198,12 @@ export async function downloadTrack(track, onProgress, signal, concurrency = 6) 
       while (true) {
         try {
           const resp = await fetch(url, {
-            credentials: "include",
+            // IMPORTANT: credentials must be 'omit'. Skool's CDN replies
+            // with Access-Control-Allow-Origin: '*', and browsers refuse to
+            // expose a '*' ACAO response when credentials are included. The
+            // signed JWT token in the URL is what authorizes the request —
+            // no cookies needed.
+            credentials: "omit",
             referrer: "https://www.skool.com/",
           });
           if (!resp.ok) {
@@ -251,7 +256,9 @@ export async function fetchPlaylist(url) {
   let resp;
   try {
     resp = await fetch(url, {
-      credentials: "include",
+      // See note in downloadTrack: 'omit' is required because the CDN uses
+      // ACAO '*' and the token in the URL authorizes the request.
+      credentials: "omit",
       referrer: "https://www.skool.com/",
     });
   } catch (e) {
