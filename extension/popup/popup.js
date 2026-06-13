@@ -179,13 +179,23 @@ btnInspect.addEventListener("click", async () => {
         }`
       );
     });
-    s.playerCandidates.forEach((c, i) => {
+    s.playerLike.forEach((c, i) => {
       appendLog(
-        `  cand[${i}] ${c.tag} testid=${c.testid || "-"} cls=${
+        `  playerLike[${i}] ${c.tag} ${c.w}x${c.h} cls=${
           c.cls ? c.cls.slice(0, 50) : "-"
         }`
       );
     });
+    if (s.shadowRoots && s.shadowRoots.length) {
+      appendLog(`shadow roots: ${s.shadowRoots.length}`);
+      s.shadowRoots.forEach((sh, i) => {
+        appendLog(
+          `  shadow[${i}] host=${sh.host} kids=${sh.childTags.join(",")}${
+            sh.hasVideo ? " HAS_VIDEO" : ""
+          }`
+        );
+      });
+    }
     appendLog("Done. Use 'Copy debug log' to send full details.", "ok");
   } catch (e) {
     appendLog("Error: " + e.message, "err");
